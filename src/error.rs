@@ -44,3 +44,13 @@ impl From<hardy_cbor::decode::Error> for RegoRoutingError {
         Self::CborDecode(err.to_string())
     }
 }
+
+impl From<dtnpm_core::mesh_blocks::MeshBlockError> for RegoRoutingError {
+    fn from(err: dtnpm_core::mesh_blocks::MeshBlockError) -> Self {
+        match err {
+            dtnpm_core::mesh_blocks::MeshBlockError::CborEncode(msg) => Self::CborEncode(msg),
+            dtnpm_core::mesh_blocks::MeshBlockError::CborDecode(msg) => Self::CborDecode(msg),
+            dtnpm_core::mesh_blocks::MeshBlockError::InvalidInput(msg) => Self::InvalidConfig(msg),
+        }
+    }
+}

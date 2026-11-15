@@ -201,10 +201,10 @@ async fn hardy_bpa_pipeline_enforces_blacklist_hop_limit_and_rewrites() {
         let bt = u64::from(blk.block_type);
         if bt == BLOCK_TYPE_SPRAY_PERMIT {
             let payload = blk.payload(&parsed.data).expect("payload 194");
-            found_194 = Some(decode_spray_permit(payload.as_ref()).expect("decode 194"));
+            found_194 = Some(decode_spray_permit(payload).expect("decode 194"));
         } else if bt == DEFAULT_BLOCK_TYPE_TREB {
             let payload = blk.payload(&parsed.data).expect("payload treb");
-            found_treb = Some(TrebData::decode_cbor(payload.as_ref()).expect("decode treb"));
+            found_treb = Some(TrebData::decode_cbor(payload).expect("decode treb"));
         }
     }
 
