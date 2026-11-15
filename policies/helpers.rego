@@ -264,9 +264,19 @@ is_aprs_loop_or_trap(bundle, node) if {
 	is_trapped_alias(hop.scope_name, node)
 }
 
+is_externally_received(bundle, _node) if {
+	get_extension_block(bundle.extension_blocks, constants.block_type_previous_node)
+}
+
+is_externally_received(bundle, node) if {
+	treb := get_treb_block(bundle, node)
+	count(object.get(treb.payload, "hops", [])) > 0
+}
+
 is_aprs_loop_or_trap(bundle, node) if {
 	has_aprs_trajectory(bundle)
 	is_own_packet(bundle, node)
+	is_externally_received(bundle, node)
 }
 
 is_aprs_loop_or_trap(bundle, node) if {
