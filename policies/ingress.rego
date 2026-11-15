@@ -162,6 +162,12 @@ aprs_next_strict_target(traj) := target if {
 	next_hop := traj.path_elements[idx]
 	helpers.is_strict_hop(next_hop)
 	target := next_hop.target_id
+} else := input.bundle.primary.destination if {
+	idx := traj.active_hop_index
+	hop := traj.path_elements[idx]
+	helpers.is_strict_match(hop, input.node)
+	(idx + 1) >= count(traj.path_elements)
+	not helpers.is_local_destination(input.bundle.primary.destination, input.node)
 } else := null
 
 aprs_can_service_alias if {

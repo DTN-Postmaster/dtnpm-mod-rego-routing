@@ -7,14 +7,14 @@ use hardy_bpa::filter::{
     Boundary, Classifier, ClassifyContext, RewriteContext, Rewriter, Verdict, Verifier,
     VerifyContext, pack::FilterPack, slots::MetadataDelta,
 };
-use hardy_bpv7::{block, crc, eid::Eid, status_report::ReasonCode};
+use hardy_bpv7::{block, crc, status_report::ReasonCode};
 use tracing::{debug, warn};
 
 use crate::blocks::{
     BLOCK_TYPE_MESH_ROUTING, BLOCK_TYPE_SPRAY_PERMIT, MeshRoutingData, PathElement, PolicyMutation,
     StagedBundleDecision, TrebData, TrebHopEntry, encode_spray_permit,
 };
-use crate::engine::{RegoRoutingEngine, canonical_bundle_key};
+use crate::engine::{RegoRoutingEngine, canonical_bundle_key, resolve_next_hop_eid};
 use crate::policy::RegoDecision;
 
 hardy_bpa::slot!(pub static REGO_BUNDLE_DECISION: StagedBundleDecision);
@@ -93,13 +93,17 @@ impl Classifier for RegoIngressClassifier {
         let mut delta = MetadataDelta::default();
         delta.set(&REGO_BUNDLE_DECISION, &staged);
 
-        if let Some(rk) = &decision.route_key {
-            match rk.parse::<Eid>() {
-                Ok(eid) => {
-                    delta.route_key = Some(eid);
+        if decision.action == "ACCEPT"
+            && let Some(rk) = &decision.route_key
+        {
+            match resolve_next_hop_eid(rk) {
+                Some(next_hop_eid) => {
+                    delta.route_key = Some(next_hop_eid.clone());
+                    self.engine
+                        .request_dynamic_route(next_hop_eid.clone(), next_hop_eid);
                 }
-                Err(err) => {
-                    debug!("Ignoring non-EID route_key '{rk}': {err}");
+                None => {
+                    debug!("Ignoring unresolvable route_key '{rk}'");
                 }
             }
         }

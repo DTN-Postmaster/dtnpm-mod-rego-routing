@@ -104,6 +104,32 @@ impl Default for RegoRoutingConfig {
     }
 }
 
+/// Resolves a Rego `route_key` (either a full EID like `"dtn://statc/files"` or a
+/// callsign like `"STATB"`) into the administrative node EID (`"dtn://statc/"` / `"dtn://statb/"`).
+#[must_use]
+pub fn resolve_next_hop_eid(route_key: &str) -> Option<Eid> {
+    let trimmed = route_key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(eid) = trimmed.parse::<Eid>() {
+        return Some(match eid {
+            Eid::Dtn { node_name, .. } => Eid::Dtn {
+                node_name,
+                service_name: "".into(),
+            },
+            Eid::Ipn { fqnn, .. } => Eid::Ipn {
+                fqnn,
+                service_number: 0,
+            },
+            other => other,
+        });
+    }
+    format!("dtn://{}/", trimmed.to_ascii_lowercase())
+        .parse::<Eid>()
+        .ok()
+}
+
 /// Validates and normalizes an EID or wildcard pattern before storage or Rego injection.
 pub fn validate_eid_pattern(pattern: &str) -> Result<String, RegoRoutingError> {
     let trimmed = pattern.trim();
@@ -212,6 +238,7 @@ struct RegoRoutingState {
     spray_tracker: BoundedSprayTracker,
     decision_log: VecDeque<DecisionAuditEntry>,
     next_audit_id: u64,
+    route_tx: Option<tokio::sync::mpsc::Sender<(Eid, Eid)>>,
 }
 
 /// Thread-safe facade used concurrently by Hardy BPA pipeline filters and the REST API.
@@ -247,8 +274,29 @@ impl RegoRoutingEngine {
                 spray_tracker: BoundedSprayTracker::new(spray_cap),
                 decision_log: VecDeque::new(),
                 next_audit_id: 1,
+                route_tx: None,
             })),
         })
+    }
+
+    /// Registers the channel used by [`RegoIngressClassifier`] to ask [`RegoRoutingAgent`]
+    /// to install dynamic `RouteAction::Via` entries into Hardy's RIB.
+    pub fn set_route_sender(&self, tx: tokio::sync::mpsc::Sender<(Eid, Eid)>) {
+        let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
+        guard.route_tx = Some(tx);
+    }
+
+    /// Enqueues a non-blocking dynamic `RouteAction::Via(next_hop_eid)` request for `pattern_eid`.
+    pub fn request_dynamic_route(&self, pattern_eid: Eid, next_hop_eid: Eid) {
+        let tx_opt = {
+            let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
+            guard.route_tx.clone()
+        };
+        if let Some(tx) = tx_opt
+            && let Err(err) = tx.try_send((pattern_eid, next_hop_eid))
+        {
+            warn!("Failed to enqueue dynamic Rego route request: {err}");
+        }
     }
 
     /// Returns a snapshot of configured blacklist entries.

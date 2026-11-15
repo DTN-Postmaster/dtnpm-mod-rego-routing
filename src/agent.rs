@@ -1,6 +1,7 @@
 //! Hardy BPA [`RoutingAgent`] implementation driven by the Rego routing engine,
 //! including dynamic route management helpers prepared for Hardy `feat/spray-n-wait`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hardy_async::async_trait;
@@ -21,7 +22,7 @@ pub const DEFAULT_REGO_ROUTE_PRIORITY: u32 = 100;
 /// programmatic route helpers for dynamic / Spray-and-Wait / APRS routing rules.
 pub struct RegoRoutingAgent {
     engine: Arc<RegoRoutingEngine>,
-    sink: RwLock<Option<Box<dyn RoutingSink>>>,
+    sink: RwLock<Option<Arc<dyn RoutingSink>>>,
 }
 
 impl std::fmt::Debug for RegoRoutingAgent {
@@ -116,8 +117,47 @@ impl RoutingAgent for RegoRoutingAgent {
             "RegoRoutingAgent registered with Hardy BPA"
         );
         self.engine.set_node_eids(eid_strings);
-        let mut guard = self.sink.write().await;
-        *guard = Some(sink);
+        let sink_arc: Arc<dyn RoutingSink> = Arc::from(sink);
+        {
+            let mut guard = self.sink.write().await;
+            *guard = Some(sink_arc.clone());
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Eid, Eid)>(256);
+        self.engine.set_route_sender(tx);
+        tokio::spawn(async move {
+            let mut installed: HashSet<(Eid, Eid)> = HashSet::new();
+            while let Some((pattern_eid, next_hop_eid)) = rx.recv().await {
+                if !installed.insert((pattern_eid.clone(), next_hop_eid.clone())) {
+                    continue;
+                }
+                let pattern: EidPattern = pattern_eid.clone().into();
+                match sink_arc
+                    .add_route(
+                        pattern.clone(),
+                        RouteAction::Via(next_hop_eid.clone()),
+                        DEFAULT_REGO_ROUTE_PRIORITY,
+                    )
+                    .await
+                {
+                    Ok(added) => {
+                        info!(
+                            pattern = %pattern,
+                            next_hop = %next_hop_eid,
+                            added,
+                            "RegoRoutingAgent installed dynamic Via route from Rego decision"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            pattern = %pattern,
+                            next_hop = %next_hop_eid,
+                            "RegoRoutingAgent failed to add dynamic Via route: {err}"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     async fn on_unregister(&self) {
