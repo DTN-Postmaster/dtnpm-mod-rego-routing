@@ -1,0 +1,49 @@
+[package]
+name = "dtnpm-mod-rego-routing"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Moteur de routage et filtrage déclaratif OPA/Rego (regorus) pour Hardy BPA et DTN Postmaster"
+repository = "https://github.com/dtn-postmaster/dtnpm-mod-rego-routing"
+keywords = ["dtn", "bpv7", "rego", "opa", "routing", "aprs", "spray-and-wait"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:tracing-subscriber"]
+
+[[bin]]
+name = "dtnpm-mod-rego-routing"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+dtnpm-core = { version = "0.2", path = "../dtnpm-core" }
+dtnpm-web-core = { version = "0.2", path = "../dtnpm-web-core" }
+hardy-async = { version = "0.2", path = "../../hardy/async" }
+hardy-bpa = { version = "0.2", path = "../../hardy/bpa", default-features = false, features = ["serde", "rfc9173", "tokio"] }
+hardy-bpv7 = { version = "0.6", path = "../../hardy/bpv7", features = ["std", "serde", "rfc9173"] }
+hardy-cbor = { version = "2", path = "../../hardy/cbor" }
+hardy-eid-patterns = { version = "0.4", path = "../../hardy/eid-patterns", features = ["serde", "dtn-pat-item"] }
+
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+ciborium = "0.2"
+regorus = { version = "0.15", default-features = false, features = ["arc", "std", "base64", "glob", "hex", "net", "regex", "time", "rvm"] }
+rusqlite = { version = "0.40", features = ["array", "bundled", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros"] }
+tokio = { version = "1.43", features = ["full"] }
+tracing = "0.1"
+
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
+tempfile = "3"
+tokio = { version = "1.43", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
