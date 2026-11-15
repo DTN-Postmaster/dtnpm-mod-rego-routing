@@ -312,3 +312,236 @@ async fn aprs_three_node_dynamic_via_routing_simulation() {
     let visited: Vec<&str> = treb.hops.iter().map(|h| h.node_eid.as_str()).collect();
     assert_eq!(visited, vec!["dtn://stata/", "dtn://statb/"]);
 }
+
+async fn register_inbound_cla(bpa: &Bpa, name: &str) -> Arc<MockCla> {
+    let (cla, _) = MockCla::new();
+    bpa.register_cla(name.to_string(), cla.clone(), None, ClaInit::default())
+        .await
+        .expect("register inbound cla");
+    cla
+}
+
+async fn connect_outbound_peer(
+    bpa: &Bpa,
+    cla_name: &str,
+    peer_node_id: &str,
+) -> MpscReceiver<Bytes> {
+    let (cla, rx) = MockCla::new();
+    bpa.register_cla(cla_name.to_string(), cla.clone(), None, ClaInit::default())
+        .await
+        .expect("register outbound cla");
+    let peer: NodeId = peer_node_id.parse().expect("valid peer node id");
+    cla.sink
+        .get()
+        .expect("outbound cla sink")
+        .add_peer(
+            ClaAddress::Private(Bytes::from(peer_node_id.as_bytes().to_vec())),
+            &[peer],
+        )
+        .await
+        .expect("add_peer");
+    rx
+}
+
+async fn dispatch_bundle(cla: &MockCla, from_node: Option<&str>, mut wire: Bytes) {
+    let peer_node = from_node.map(|s| s.parse::<NodeId>().expect("valid from_node"));
+    let acceptance = cla
+        .sink
+        .get()
+        .expect("inbound cla sink")
+        .dispatch(peer_node.as_ref(), None, &mut wire)
+        .await
+        .expect("dispatch");
+    assert_eq!(acceptance, Acceptance::Accepted);
+}
+
+fn build_aprs_bundle(
+    src: &str,
+    dst: &str,
+    aprs_path: &str,
+    hop_limit: u8,
+    payload: &[u8],
+) -> Bytes {
+    let src_eid: Eid = src.parse().expect("src");
+    let dst_eid: Eid = dst.parse().expect("dst");
+    let builder = Builder::new(src_eid, dst_eid).with_payload(payload.into());
+    let builder = apply_routing_extensions(builder, Some(hop_limit), Some(aprs_path), None)
+        .expect("apply routing extensions");
+    let (_bundle, raw_bundle) = builder
+        .build(CreationTimestamp::now())
+        .expect("build bundle");
+    Bytes::from(raw_bundle.into_vec())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aprs_multi_hop_divergent_per_bundle_paths_simulation() {
+    // 6-node mesh with zero static routes:
+    //   Path 1: STATA -> STATB -> STATC -> STATD -> STATE (aprs_path = "STATB,STATC,STATD")
+    //   Path 2: STATA -> STATF -> STATD -> STATE          (aprs_path = "STATF,STATD")
+    // Both bundles target the exact same destination "dtn://state/files".
+    let bpa_a = start_rego_node("STATA", "dtn://stata/").await;
+    let bpa_b = start_rego_node("STATB", "dtn://statb/").await;
+    let bpa_c = start_rego_node("STATC", "dtn://statc/").await;
+    let bpa_d = start_rego_node("STATD", "dtn://statd/").await;
+    let bpa_e = start_rego_node("STATE", "dtn://state/").await;
+    let bpa_f = start_rego_node("STATF", "dtn://statf/").await;
+
+    let cla_a_in = register_inbound_cla(&bpa_a, "cla_a_in").await;
+    let cla_b_in = register_inbound_cla(&bpa_b, "cla_b_in").await;
+    let cla_c_in = register_inbound_cla(&bpa_c, "cla_c_in").await;
+    let cla_d_in = register_inbound_cla(&bpa_d, "cla_d_in").await;
+    let cla_e_in = register_inbound_cla(&bpa_e, "cla_e_in").await;
+    let cla_f_in = register_inbound_cla(&bpa_f, "cla_f_in").await;
+
+    let mut rx_a_to_b = connect_outbound_peer(&bpa_a, "a_to_b", "dtn://statb/").await;
+    let mut rx_a_to_f = connect_outbound_peer(&bpa_a, "a_to_f", "dtn://statf/").await;
+    let mut rx_b_to_c = connect_outbound_peer(&bpa_b, "b_to_c", "dtn://statc/").await;
+    let mut rx_c_to_d = connect_outbound_peer(&bpa_c, "c_to_d", "dtn://statd/").await;
+    let mut rx_f_to_d = connect_outbound_peer(&bpa_f, "f_to_d", "dtn://statd/").await;
+    let mut rx_d_to_e = connect_outbound_peer(&bpa_d, "d_to_e", "dtn://state/").await;
+
+    let (delivered_tx, mut delivered_rx) = channel(4);
+    let file_svc = Arc::new(MockFileService {
+        sink: Once::new(),
+        delivered_tx,
+    });
+    bpa_e
+        .register_service(ServiceId::Dtn("files".into()), file_svc)
+        .await
+        .expect("register files service on STATE");
+
+    // --- Bundle 1: STATA -> STATB -> STATC -> STATD -> STATE ---
+    let payload_1 = b"Bundle 1 via B-C-D";
+    let wire_1 = build_aprs_bundle(
+        "dtn://stata/",
+        "dtn://state/files",
+        "STATB,STATC,STATD",
+        10,
+        payload_1,
+    );
+    dispatch_bundle(&cla_a_in, None, wire_1).await;
+
+    let b1_at_b = timeout(Duration::from_secs(5), rx_a_to_b.recv())
+        .await
+        .expect("B1 A->B timeout")
+        .expect("rx_a_to_b closed");
+    dispatch_bundle(&cla_b_in, Some("dtn://stata/"), b1_at_b).await;
+
+    let b1_at_c = timeout(Duration::from_secs(5), rx_b_to_c.recv())
+        .await
+        .expect("B1 B->C timeout")
+        .expect("rx_b_to_c closed");
+    dispatch_bundle(&cla_c_in, Some("dtn://statb/"), b1_at_c).await;
+
+    let b1_at_d = timeout(Duration::from_secs(5), rx_c_to_d.recv())
+        .await
+        .expect("B1 C->D timeout")
+        .expect("rx_c_to_d closed");
+    dispatch_bundle(&cla_d_in, Some("dtn://statc/"), b1_at_d).await;
+
+    let b1_at_e = timeout(Duration::from_secs(5), rx_d_to_e.recv())
+        .await
+        .expect("B1 D->E timeout")
+        .expect("rx_d_to_e closed");
+    dispatch_bundle(&cla_e_in, Some("dtn://statd/"), b1_at_e).await;
+
+    let delivered_1 = timeout(Duration::from_secs(5), delivered_rx.recv())
+        .await
+        .expect("B1 delivery timeout")
+        .expect("delivered_rx closed");
+    let parsed_1 = parse(delivered_1).expect("parse delivered B1");
+    assert_eq!(
+        parsed_1
+            .bundle
+            .blocks
+            .get(&1)
+            .and_then(|b| b.payload(&parsed_1.data)),
+        Some(payload_1.as_slice())
+    );
+    let ext_1 = extract_routing_extensions(&parsed_1.bundle, &parsed_1.data);
+    assert_eq!(
+        ext_1.hop_count,
+        Some(HopCountInfo {
+            count: 4,
+            limit: 10
+        })
+    );
+    assert_eq!(
+        ext_1.aprs_path_formatted.as_deref(),
+        Some("STATB*,STATC*,STATD*")
+    );
+    let treb_1 = ext_1.treb.expect("TREB for B1");
+    let visited_1: Vec<&str> = treb_1.hops.iter().map(|h| h.node_eid.as_str()).collect();
+    assert_eq!(
+        visited_1,
+        vec![
+            "dtn://stata/",
+            "dtn://statb/",
+            "dtn://statc/",
+            "dtn://statd/"
+        ]
+    );
+
+    // --- Bundle 2: same destination dtn://state/files, divergent path STATF,STATD ---
+    // Must NOT go through STATB even though STATA already has Via(dtn://statb/) installed!
+    let payload_2 = b"Bundle 2 via F-D";
+    let wire_2 = build_aprs_bundle(
+        "dtn://stata/",
+        "dtn://state/files",
+        "STATF,STATD",
+        10,
+        payload_2,
+    );
+    dispatch_bundle(&cla_a_in, None, wire_2).await;
+
+    let b2_at_f = timeout(Duration::from_secs(5), rx_a_to_f.recv())
+        .await
+        .expect("B2 A->F timeout")
+        .expect("rx_a_to_f closed");
+    assert!(
+        rx_a_to_b.try_recv().is_err(),
+        "Bundle 2 must NOT be forwarded to STATB"
+    );
+    dispatch_bundle(&cla_f_in, Some("dtn://stata/"), b2_at_f).await;
+
+    let b2_at_d = timeout(Duration::from_secs(5), rx_f_to_d.recv())
+        .await
+        .expect("B2 F->D timeout")
+        .expect("rx_f_to_d closed");
+    dispatch_bundle(&cla_d_in, Some("dtn://statf/"), b2_at_d).await;
+
+    let b2_at_e = timeout(Duration::from_secs(5), rx_d_to_e.recv())
+        .await
+        .expect("B2 D->E timeout")
+        .expect("rx_d_to_e closed");
+    dispatch_bundle(&cla_e_in, Some("dtn://statd/"), b2_at_e).await;
+
+    let delivered_2 = timeout(Duration::from_secs(5), delivered_rx.recv())
+        .await
+        .expect("B2 delivery timeout")
+        .expect("delivered_rx closed");
+    let parsed_2 = parse(delivered_2).expect("parse delivered B2");
+    assert_eq!(
+        parsed_2
+            .bundle
+            .blocks
+            .get(&1)
+            .and_then(|b| b.payload(&parsed_2.data)),
+        Some(payload_2.as_slice())
+    );
+    let ext_2 = extract_routing_extensions(&parsed_2.bundle, &parsed_2.data);
+    assert_eq!(
+        ext_2.hop_count,
+        Some(HopCountInfo {
+            count: 3,
+            limit: 10
+        })
+    );
+    assert_eq!(ext_2.aprs_path_formatted.as_deref(), Some("STATF*,STATD*"));
+    let treb_2 = ext_2.treb.expect("TREB for B2");
+    let visited_2: Vec<&str> = treb_2.hops.iter().map(|h| h.node_eid.as_str()).collect();
+    assert_eq!(
+        visited_2,
+        vec!["dtn://stata/", "dtn://statf/", "dtn://statd/"]
+    );
+}
