@@ -54,6 +54,7 @@ pub struct UpdatePolicyRequest {
     pub treb_block_type: Option<u64>,
     pub custom_ingress_rego: Option<String>,
     pub custom_egress_rego: Option<String>,
+    pub custom_routing_rego: Option<String>,
     #[serde(default)]
     pub reset_to_default: bool,
 }
@@ -166,7 +167,14 @@ pub async fn create_blacklist(
                 &entry.created_by,
             ],
         )
-        .map_err(|e| err_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                err_response(StatusCode::CONFLICT, "EID pattern is already blacklisted")
+            }
+            other => err_response(StatusCode::INTERNAL_SERVER_ERROR, other),
+        })?;
     }
 
     state.engine.upsert_blacklist_entry(entry.clone());
@@ -280,26 +288,31 @@ pub async fn update_policy(
 ) -> Result<Json<PolicyStatusResponse>, ApiErr> {
     let current = state.engine.config();
 
-    let (active_profile, custom_ingress, custom_egress) = if payload.reset_to_default {
-        ("default".to_string(), None, None)
-    } else {
-        let ingress = payload
-            .custom_ingress_rego
-            .or(current.custom_ingress_rego.clone())
-            .filter(|s| !s.trim().is_empty());
-        let egress = payload
-            .custom_egress_rego
-            .or(current.custom_egress_rego.clone())
-            .filter(|s| !s.trim().is_empty());
-        let profile = payload.active_profile.unwrap_or_else(|| {
-            if ingress.is_some() || egress.is_some() {
-                "custom".to_string()
-            } else {
-                current.active_profile.clone()
-            }
-        });
-        (profile, ingress, egress)
-    };
+    let (active_profile, custom_ingress, custom_egress, custom_routing) =
+        if payload.reset_to_default {
+            ("default".to_string(), None, None, None)
+        } else {
+            let ingress = payload
+                .custom_ingress_rego
+                .or(current.custom_ingress_rego.clone())
+                .filter(|s| !s.trim().is_empty());
+            let egress = payload
+                .custom_egress_rego
+                .or(current.custom_egress_rego.clone())
+                .filter(|s| !s.trim().is_empty());
+            let routing = payload
+                .custom_routing_rego
+                .or(current.custom_routing_rego.clone())
+                .filter(|s| !s.trim().is_empty());
+            let profile = payload.active_profile.unwrap_or_else(|| {
+                if ingress.is_some() || egress.is_some() || routing.is_some() {
+                    "custom".to_string()
+                } else {
+                    current.active_profile.clone()
+                }
+            });
+            (profile, ingress, egress, routing)
+        };
 
     if active_profile.len() > 64
         || !active_profile
@@ -315,18 +328,20 @@ pub async fn update_policy(
     let hop_limit = payload.hop_limit.unwrap_or(current.hop_limit);
     let treb_block_type = payload.treb_block_type.unwrap_or(current.treb_block_type);
 
+    let prev_sources = state.engine.policy_sources();
     state
         .engine
-        .update_policy(
+        .update_policy_with_routing(
             active_profile.clone(),
             hop_limit,
             treb_block_type,
             custom_ingress.clone(),
             custom_egress.clone(),
+            custom_routing.clone(),
         )
         .map_err(|e| err_response(StatusCode::BAD_REQUEST, e))?;
 
-    {
+    let persist_res: Result<(), (StatusCode, Json<serde_json::Value>)> = (|| {
         let conn_lock = state.ctx.internal_storage.connection();
         let conn = conn_lock.lock().map_err(|_| {
             err_response(StatusCode::INTERNAL_SERVER_ERROR, "Database lock poisoned")
@@ -335,14 +350,15 @@ pub async fn update_policy(
 
         conn.execute(
             "INSERT INTO rego_policy_config
-                (id, active_profile, hop_limit, treb_block_type, custom_ingress_rego, custom_egress_rego, updated_at, updated_by)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 'webui')
+                (id, active_profile, hop_limit, treb_block_type, custom_ingress_rego, custom_egress_rego, custom_routing_rego, updated_at, updated_by)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'webui')
              ON CONFLICT(id) DO UPDATE SET
                 active_profile = excluded.active_profile,
                 hop_limit = excluded.hop_limit,
                 treb_block_type = excluded.treb_block_type,
                 custom_ingress_rego = excluded.custom_ingress_rego,
                 custom_egress_rego = excluded.custom_egress_rego,
+                custom_routing_rego = excluded.custom_routing_rego,
                 updated_at = excluded.updated_at,
                 updated_by = excluded.updated_by",
             rusqlite::params![
@@ -351,10 +367,33 @@ pub async fn update_policy(
                 i64::try_from(treb_block_type).unwrap_or(201),
                 custom_ingress,
                 custom_egress,
+                custom_routing,
                 now_ts,
             ],
         )
         .map_err(|e| err_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        Ok(())
+    })();
+
+    if let Err(err) = persist_res {
+        let (prev_in, prev_eg, prev_rt) = if current.active_profile == "custom" {
+            (
+                Some(prev_sources.ingress),
+                Some(prev_sources.egress),
+                Some(prev_sources.routing),
+            )
+        } else {
+            (None, None, None)
+        };
+        let _ = state.engine.update_policy_with_routing(
+            current.active_profile,
+            current.hop_limit,
+            current.treb_block_type,
+            prev_in,
+            prev_eg,
+            prev_rt,
+        );
+        return Err(err);
     }
 
     Ok(Json(PolicyStatusResponse {

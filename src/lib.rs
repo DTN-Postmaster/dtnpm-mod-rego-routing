@@ -19,13 +19,16 @@ pub mod policy;
 pub mod routes;
 
 pub use agent::RegoRoutingAgent;
-pub use engine::{BlacklistEntry, DecisionAuditEntry, RegoRoutingConfig, RegoRoutingEngine};
+pub use engine::{
+    BlacklistEntry, DecisionAuditEntry, DynamicRouteCommand, NeighborPeer, RegoRoutingConfig,
+    RegoRoutingEngine,
+};
 pub use error::RegoRoutingError;
 pub use filter::{
     REGO_BUNDLE_DECISION, RegoEgressRewriter, RegoIngressClassifier, RegoIngressVerifier,
     build_filter_pack,
 };
-pub use policy::{PolicySources, PolicySuite, RegoDecision};
+pub use policy::{DesiredRoute, PolicySources, PolicySuite, RegoDecision};
 
 use crate::routes::RegoRouteState;
 
@@ -97,21 +100,45 @@ impl RegoRoutingModule {
         }
         self.engine.replace_blacklist(entries);
 
-        type PolicyRow = (String, i64, i64, Option<String>, Option<String>);
-        let policy_row: Option<PolicyRow> = conn
-            .query_row(
-                "SELECT active_profile, hop_limit, treb_block_type, custom_ingress_rego, custom_egress_rego
+        // Ensure legacy databases without custom_routing_rego are upgraded gracefully.
+        let _ = conn.execute(
+            "ALTER TABLE rego_policy_config ADD COLUMN custom_routing_rego TEXT",
+            [],
+        );
+
+        type PolicyRow = (
+            String,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let policy_row: Option<PolicyRow> = rusqlite::OptionalExtension::optional(
+            conn.query_row(
+                "SELECT active_profile, hop_limit, treb_block_type, custom_ingress_rego, custom_egress_rego, custom_routing_rego
                  FROM rego_policy_config WHERE id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-            )
-            .ok();
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            ),
+        )?;
 
-        if let Some((profile, hop_limit, treb_block_type, custom_in, custom_eg)) = policy_row {
+        if let Some((profile, hop_limit, treb_block_type, custom_in, custom_eg, custom_rt)) =
+            policy_row
+        {
             let hl = u8::try_from(hop_limit).unwrap_or(16).max(1);
             let tb = u64::try_from(treb_block_type).unwrap_or(blocks::DEFAULT_BLOCK_TYPE_TREB);
             self.engine
-                .update_policy(profile, hl, tb, custom_in, custom_eg)?;
+                .update_policy_with_routing(profile, hl, tb, custom_in, custom_eg, custom_rt)?;
         }
 
         Ok(())

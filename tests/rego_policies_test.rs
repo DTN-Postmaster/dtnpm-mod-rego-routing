@@ -403,3 +403,486 @@ decision := {
     let res = custom_suite.evaluate_ingress(&custom_input).expect("eval");
     assert_eq!(res.action, "ACCEPT");
 }
+
+#[test]
+fn egress_direct_delivery_matches_node_eid_to_service_eid() {
+    let suite = PolicySuite::compile(PolicySources::default()).expect("compile");
+    let node = base_node();
+
+    // IPN node peer (ipn:0.99.0) delivering to service EID (ipn:0.99.1) in WAIT phase (quota = 1)
+    let ipn_input = serde_json::json!({
+        "bundle": base_bundle("ipn:0.1.1", "ipn:0.99.1", vec![
+            serde_json::json!({ "block_type": 194, "payload": { "quota": 1 } })
+        ]),
+        "node": node,
+        "current_dtn_time_ms": 2000,
+        "contact": {
+            "peer_eid": "ipn:0.99.0",
+            "cla_type": "bpa",
+            "is_broadcast": false,
+            "held_bundle_ids": [],
+        }
+    });
+    let ipn_dec = suite.evaluate_egress(&ipn_input).expect("eval ipn");
+    assert_eq!(
+        ipn_dec.action, "FORWARD_DIRECT",
+        "ipn:0.99.0 must match ipn:0.99.1 as direct destination even in WAIT phase"
+    );
+
+    // DTN node peer (dtn://statc/) delivering to service EID (dtn://statc/files) in WAIT phase
+    let dtn_input = serde_json::json!({
+        "bundle": base_bundle("dtn://stata/app", "dtn://statc/files", vec![
+            serde_json::json!({ "block_type": 194, "payload": { "quota": 1 } })
+        ]),
+        "node": node,
+        "current_dtn_time_ms": 2000,
+        "contact": {
+            "peer_eid": "dtn://statc/",
+            "cla_type": "bpa",
+            "is_broadcast": false,
+            "held_bundle_ids": [],
+        }
+    });
+    let dtn_dec = suite.evaluate_egress(&dtn_input).expect("eval dtn");
+    assert_eq!(
+        dtn_dec.action, "FORWARD_DIRECT",
+        "dtn://statc/ must match dtn://statc/files as direct destination"
+    );
+}
+
+#[test]
+fn spray_and_wait_binary_odd_source_mode_and_loop_guards() {
+    let suite = PolicySuite::compile(PolicySources::default()).expect("compile");
+    let node = base_node();
+
+    // 1. Binary Spray with odd L=5 -> tx=floor(5/2)=2 (disseminate), keep=3 (disseminate)
+    let odd_input = serde_json::json!({
+        "bundle": base_bundle("dtn://src/1", "dtn://dest/1", vec![
+            serde_json::json!({
+                "block_type": 200,
+                "payload": { "replication_control": { "quota": 5, "mode": 2, "phase": 1 } }
+            })
+        ]),
+        "node": node,
+        "current_dtn_time_ms": 2000,
+        "contact": { "peer_eid": "dtn://relay-1/", "cla_type": "tcpcl", "is_broadcast": false }
+    });
+    let odd_dec = suite.evaluate_egress(&odd_input).expect("eval odd binary");
+    assert_eq!(odd_dec.action, "FORWARD_REPLICATE");
+    assert_eq!(odd_dec.mutations[0].transmitted_quota, Some(2));
+    assert_eq!(odd_dec.mutations[0].local_quota, Some(3));
+    assert_eq!(odd_dec.mutations[0].transmitted_phase, Some(1));
+    assert_eq!(odd_dec.mutations[0].local_phase, Some(1));
+
+    // 2. Source Spray (mode=1) with L=5 -> tx=1 (wait), keep=4 (disseminate)
+    let source_input = serde_json::json!({
+        "bundle": base_bundle("dtn://src/1", "dtn://dest/1", vec![
+            serde_json::json!({
+                "block_type": 200,
+                "payload": { "replication_control": { "quota": 5, "mode": 1, "phase": 1 } }
+            })
+        ]),
+        "node": node,
+        "current_dtn_time_ms": 2000,
+        "contact": { "peer_eid": "dtn://relay-1/", "cla_type": "tcpcl", "is_broadcast": false }
+    });
+    let src_dec = suite.evaluate_egress(&source_input).expect("eval source");
+    assert_eq!(src_dec.action, "FORWARD_REPLICATE");
+    assert_eq!(src_dec.mutations[0].transmitted_quota, Some(1));
+    assert_eq!(src_dec.mutations[0].local_quota, Some(4));
+    assert_eq!(src_dec.mutations[0].transmitted_phase, Some(2));
+    assert_eq!(src_dec.mutations[0].local_phase, Some(1));
+
+    // 3. Peer already holds bundle copy -> SKIP
+    let held_input = serde_json::json!({
+        "bundle": base_bundle("dtn://src/1", "dtn://dest/1", vec![
+            serde_json::json!({ "block_type": 194, "payload": { "quota": 4 } })
+        ]),
+        "node": node,
+        "current_dtn_time_ms": 2000,
+        "contact": {
+            "peer_eid": "dtn://relay-1/",
+            "cla_type": "tcpcl",
+            "is_broadcast": false,
+            "held_bundle_ids": ["dtn://src/1@1000#1"]
+        }
+    });
+    assert_eq!(
+        suite
+            .evaluate_egress(&held_input)
+            .expect("eval held")
+            .action,
+        "SKIP"
+    );
+
+    // 4. Split-horizon Previous Node (Block 6) -> SKIP for relay
+    let prev_node_input = serde_json::json!({
+        "bundle": base_bundle("dtn://src/1", "dtn://dest/1", vec![
+            serde_json::json!({ "block_type": 6, "previous_node_eid": "dtn://relay-1/" }),
+            serde_json::json!({ "block_type": 194, "payload": { "quota": 4 } })
+        ]),
+        "node": node,
+        "current_dtn_time_ms": 2000,
+        "contact": { "peer_eid": "dtn://relay-1/", "cla_type": "tcpcl", "is_broadcast": false }
+    });
+    assert_eq!(
+        suite
+            .evaluate_egress(&prev_node_input)
+            .expect("eval prev")
+            .action,
+        "SKIP"
+    );
+}
+
+#[test]
+fn spray_and_wait_engine_stateful_quota_progression() {
+    use dtnpm_mod_rego_routing::{RegoRoutingConfig, RegoRoutingEngine};
+    use hardy_bpa::bundle::BundleMetadata;
+    use hardy_bpv7::block::{Flags as BlockFlags, Type as BlockType};
+    use hardy_bpv7::builder::Builder;
+    use hardy_bpv7::crc::CrcType;
+    use hardy_bpv7::creation_timestamp::CreationTimestamp;
+    use hardy_bpv7::eid::Eid;
+    use hardy_bpv7::reader::PlainReader;
+    use std::borrow::Cow;
+
+    let engine = RegoRoutingEngine::new(RegoRoutingConfig {
+        local_eid: "dtn://node1/".to_string(),
+        node_eids: vec!["dtn://node1/".to_string()],
+        ..Default::default()
+    })
+    .expect("engine");
+
+    let mut bldr = Builder::new(
+        "dtn://node1/app".parse().unwrap(),
+        "dtn://node5/incoming".parse().unwrap(),
+    )
+    .with_payload(Cow::Borrowed(b"snw-test"));
+    bldr = bldr
+        .add_extension_block(BlockType::Unrecognised(194))
+        .unwrap()
+        .with_flags(BlockFlags {
+            must_replicate: true,
+            ..Default::default()
+        })
+        .with_crc_type(CrcType::None)
+        .build(Cow::Owned(encode_spray_permit(8).into_vec()));
+    let (bundle, raw) = bldr.build(CreationTimestamp::now()).unwrap();
+
+    let reader = PlainReader {
+        blocks: &bundle.blocks,
+        source_data: &raw,
+    };
+    let meta = BundleMetadata::originated();
+
+    // Ingress seeds spray_tracker with L = 8
+    let in_dec = engine
+        .evaluate_ingress_bundle(&bundle, &reader, &meta, true)
+        .expect("ingress");
+    assert_eq!(in_dec.action, "ACCEPT");
+    assert_eq!(engine.tracked_spray_quota(&bundle), Some(8));
+
+    // Egress 1 -> node2: L=8 splits to tx=4, local=4
+    let r2: Eid = "dtn://node2/".parse().unwrap();
+    let e1 = engine
+        .evaluate_egress_bundle(&bundle, &reader, &meta, &r2)
+        .expect("egress 1");
+    assert_eq!(e1.action, "FORWARD_REPLICATE");
+    assert_eq!(e1.mutations[0].transmitted_quota, Some(4));
+    assert_eq!(engine.tracked_spray_quota(&bundle), Some(4));
+
+    // Egress 2 -> node3: L=4 splits to tx=2, local=2
+    let r3: Eid = "dtn://node3/".parse().unwrap();
+    let e2 = engine
+        .evaluate_egress_bundle(&bundle, &reader, &meta, &r3)
+        .expect("egress 2");
+    assert_eq!(e2.action, "FORWARD_REPLICATE");
+    assert_eq!(e2.mutations[0].transmitted_quota, Some(2));
+    assert_eq!(engine.tracked_spray_quota(&bundle), Some(2));
+
+    // Egress 3 -> node4: L=2 splits to tx=1, local=1
+    let r4: Eid = "dtn://node4/".parse().unwrap();
+    let e3 = engine
+        .evaluate_egress_bundle(&bundle, &reader, &meta, &r4)
+        .expect("egress 3");
+    assert_eq!(e3.action, "FORWARD_REPLICATE");
+    assert_eq!(e3.mutations[0].transmitted_quota, Some(1));
+    assert_eq!(engine.tracked_spray_quota(&bundle), Some(1));
+
+    // Egress 4 -> another relay in WAIT phase (L=1): SKIP
+    let r6: Eid = "dtn://node6/".parse().unwrap();
+    let e4 = engine
+        .evaluate_egress_bundle(&bundle, &reader, &meta, &r6)
+        .expect("egress 4");
+    assert_eq!(e4.action, "SKIP");
+
+    // Egress 5 -> destination node (dtn://node5/) in WAIT phase (L=1): FORWARD_DIRECT
+    let r5: Eid = "dtn://node5/".parse().unwrap();
+    let e5 = engine
+        .evaluate_egress_bundle(&bundle, &reader, &meta, &r5)
+        .expect("egress 5");
+    assert_eq!(e5.action, "FORWARD_DIRECT");
+}
+
+#[test]
+fn routing_policy_evaluates_default_and_custom_rules() {
+    let default_sources = PolicySources::from_dir_or_default(None).expect("embedded sources");
+    let default_suite = PolicySuite::compile(default_sources.clone()).expect("embedded suite");
+    let routing_input = serde_json::json!({
+        "node": {
+            "eid": "dtn://node1/",
+            "blacklist_sources": ["dtn://blocked/"],
+        },
+        "peers": [
+            {
+                "cla_name": "tcpcl-1",
+                "cla_type": "tcpclv4",
+                "peer_id": 1,
+                "peer_eid": "dtn://node2/",
+                "cla_addr": "127.0.0.1:4556",
+            },
+            {
+                "cla_name": "tcpcl-1",
+                "cla_type": "tcpclv4",
+                "peer_id": 2,
+                "peer_eid": "dtn://blocked/",
+                "cla_addr": "127.0.0.1:4557",
+            },
+        ],
+    });
+    assert!(
+        default_suite
+            .evaluate_routing(&routing_input)
+            .expect("eval default routing")
+            .is_empty()
+    );
+
+    let custom_routing = r#"
+package dtn.routing
+
+import data.dtn.helpers
+
+routes contains {
+    "pattern": "dtn://node5/**",
+    "action": "FORWARD_REPLICATE",
+    "next_hop": peer.peer_eid,
+    "priority": 100,
+    "reason_code": 1,
+} if {
+    some peer in input.peers
+    helpers.peer_allowed(peer, input.node)
+}
+
+routes contains {
+    "pattern": "dtn://blocked/**",
+    "action": "DROP",
+    "reason_code": 2,
+} if {
+    some peer in input.peers
+    not helpers.peer_allowed(peer, input.node)
+}
+"#;
+    let custom_suite = PolicySuite::compile(
+        default_sources
+            .with_all_overrides(None, None, Some(custom_routing))
+            .expect("override sources"),
+    )
+    .expect("custom routing suite");
+
+    let desired = custom_suite
+        .evaluate_routing(&routing_input)
+        .expect("eval custom routing");
+    assert_eq!(desired.len(), 2);
+    assert!(desired.iter().any(|r| {
+        r.pattern == "dtn://node5/**"
+            && r.action == "FORWARD_REPLICATE"
+            && r.next_hop.as_deref() == Some("dtn://node2/")
+            && r.priority == 100
+            && r.reason_code == Some(1)
+    }));
+    assert!(desired.iter().any(|r| {
+        r.pattern == "dtn://blocked/**"
+            && r.action == "DROP"
+            && r.next_hop.is_none()
+            && r.reason_code == Some(2)
+    }));
+}
+
+#[test]
+fn spray_and_wait_routing_example_compiles_and_evaluates() {
+    let base = PolicySources::from_dir_or_default(None).expect("embedded sources");
+    let snw_rego = include_str!("../policies/spray-and-wait-routing.rego");
+    let suite = PolicySuite::compile(
+        base.with_all_overrides(None, None, Some(snw_rego))
+            .expect("override sources"),
+    )
+    .expect("compile spray-and-wait-routing.rego");
+
+    let input = serde_json::json!({
+        "node": {
+            "local_eid": "dtn://node1/",
+            "node_eids": ["dtn://node1/"],
+            "blacklist_sources": ["dtn://blocked/"],
+        },
+        "peers": [
+            {
+                "cla_name": "tcpcl-1",
+                "cla_type": "tcpclv4",
+                "peer_id": 1,
+                "peer_eid": "dtn://node2/",
+                "cla_addr": "127.0.0.1:4556",
+            },
+            {
+                "cla_name": "tcpcl-1",
+                "cla_type": "tcpclv4",
+                "peer_id": 2,
+                "peer_eid": "dtn://blocked/",
+                "cla_addr": "127.0.0.1:4557",
+            },
+            {
+                "cla_name": "tcpcl-1",
+                "cla_type": "tcpclv4",
+                "peer_id": 3,
+                "peer_eid": "dtn://node1/",
+                "cla_addr": "127.0.0.1:4558",
+            },
+        ],
+    });
+
+    let desired = suite.evaluate_routing(&input).expect("eval snw routing");
+    assert_eq!(desired.len(), 2);
+    assert!(desired.iter().any(|r| {
+        r.pattern == "dtn://dest-node/**"
+            && r.action == "FORWARD_REPLICATE"
+            && r.next_hop.as_deref() == Some("dtn://node2/")
+            && r.priority == 100
+    }));
+    assert!(desired.iter().any(|r| {
+        r.pattern == "ipn:0.99.*"
+            && r.action == "FORWARD_REPLICATE"
+            && r.next_hop.as_deref() == Some("dtn://node2/")
+            && r.priority == 100
+    }));
+}
+
+#[test]
+fn aprs_routing_example_compiles_and_evaluates() {
+    let base = PolicySources::from_dir_or_default(None).expect("embedded sources");
+    let aprs_rego = include_str!("../policies/aprs-routing.rego");
+    let suite = PolicySuite::compile(
+        base.with_all_overrides(None, None, Some(aprs_rego))
+            .expect("override sources"),
+    )
+    .expect("compile aprs-routing.rego");
+
+    let input = serde_json::json!({
+        "node": {
+            "local_eid": "dtn://node1/",
+            "node_eids": ["dtn://node1/"],
+            "blacklist_sources": ["dtn://blocked/"],
+        },
+        "peers": [
+            {
+                "cla_name": "kiss-1",
+                "cla_type": "ltp",
+                "peer_id": 1,
+                "peer_eid": "dtn://digipeater-1/",
+                "cla_addr": "kiss:1",
+            },
+            {
+                "cla_name": "tcpcl-1",
+                "cla_type": "tcpclv4",
+                "peer_id": 2,
+                "peer_eid": "dtn://unrelated-node/",
+                "cla_addr": "127.0.0.1:4556",
+            },
+            {
+                "cla_name": "tcpcl-1",
+                "cla_type": "tcpclv4",
+                "peer_id": 3,
+                "peer_eid": "dtn://blocked/",
+                "cla_addr": "127.0.0.1:4557",
+            },
+        ],
+    });
+
+    let desired = suite.evaluate_routing(&input).expect("eval aprs routing");
+    assert_eq!(desired.len(), 1);
+    assert_eq!(desired[0].pattern, "dtn://aprs-igate/**");
+    assert_eq!(desired[0].action, "VIA");
+    assert_eq!(desired[0].next_hop.as_deref(), Some("dtn://digipeater-1/"));
+    assert_eq!(desired[0].priority, 90);
+}
+
+#[test]
+fn aprs_and_spray_and_wait_combined_example_compiles_and_evaluates() {
+    let base = PolicySources::from_dir_or_default(None).expect("embedded sources");
+    let combined_rego = include_str!("../policies/aprs-spray-and-wait-routing.rego");
+    let suite = PolicySuite::compile(
+        base.with_all_overrides(None, None, Some(combined_rego))
+            .expect("override sources"),
+    )
+    .expect("compile aprs-spray-and-wait-routing.rego");
+
+    let input = serde_json::json!({
+        "node": {
+            "local_eid": "dtn://node1/",
+            "node_eids": ["dtn://node1/"],
+            "blacklist_sources": ["dtn://blocked/"],
+        },
+        "peers": [
+            {
+                "cla_name": "kiss-1",
+                "cla_type": "ltp",
+                "peer_id": 1,
+                "peer_eid": "dtn://digipeater-1/",
+                "cla_addr": "kiss:1",
+            },
+            {
+                "cla_name": "tcpcl-1",
+                "cla_type": "tcpclv4",
+                "peer_id": 2,
+                "peer_eid": "dtn://node2/",
+                "cla_addr": "127.0.0.1:4556",
+            },
+            {
+                "cla_name": "tcpcl-1",
+                "cla_type": "tcpclv4",
+                "peer_id": 3,
+                "peer_eid": "dtn://blocked/",
+                "cla_addr": "127.0.0.1:4557",
+            },
+        ],
+    });
+
+    let desired = suite
+        .evaluate_routing(&input)
+        .expect("eval combined routing");
+
+    // 1 APRS VIA route (for digipeater-1) + 4 SnW FORWARD_REPLICATE routes
+    // (2 allowed destinations x 2 allowed peers: digipeater-1 & node2)
+    assert_eq!(desired.len(), 5);
+    assert!(desired.iter().any(|r| {
+        r.pattern == "dtn://aprs-igate/**"
+            && r.action == "VIA"
+            && r.next_hop.as_deref() == Some("dtn://digipeater-1/")
+            && r.priority == 90
+    }));
+    assert!(desired.iter().any(|r| {
+        r.pattern == "dtn://dest-node/**"
+            && r.action == "FORWARD_REPLICATE"
+            && r.next_hop.as_deref() == Some("dtn://node2/")
+            && r.priority == 100
+    }));
+    assert!(desired.iter().any(|r| {
+        r.pattern == "ipn:0.99.*"
+            && r.action == "FORWARD_REPLICATE"
+            && r.next_hop.as_deref() == Some("dtn://node2/")
+            && r.priority == 100
+    }));
+    assert!(
+        !desired
+            .iter()
+            .any(|r| r.next_hop.as_deref() == Some("dtn://blocked/"))
+    );
+}

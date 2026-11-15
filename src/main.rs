@@ -130,14 +130,17 @@ async fn main() -> anyhow::Result<()> {
     let bpa: Arc<dyn BpaClient> = grpc_bpa;
     let service_tracker = ServiceTracker::new(bpa_reg.clone());
     let injector = WebBundleInjector::new();
-    let _ = bpa_reg
+    if let Err(err) = bpa_reg
         .register_cla(
             "web-injector-rego-routing".to_string(),
             Arc::new(injector.clone()),
             None,
             ClaInit::default(),
         )
-        .await;
+        .await
+    {
+        tracing::warn!("Failed to register web-injector-rego-routing CLA: {err}");
+    }
 
     let rego_config = RegoRoutingConfig {
         local_eid: args.node_id,

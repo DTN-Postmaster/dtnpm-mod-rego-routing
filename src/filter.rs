@@ -7,6 +7,7 @@ use hardy_bpa::filter::{
     Boundary, Classifier, ClassifyContext, RewriteContext, Rewriter, Verdict, Verifier,
     VerifyContext, pack::FilterPack, slots::MetadataDelta,
 };
+use hardy_bpa::routing::RouteAction;
 use hardy_bpv7::{block, crc, status_report::ReasonCode};
 use tracing::{debug, warn};
 
@@ -14,7 +15,7 @@ use crate::blocks::{
     BLOCK_TYPE_MESH_ROUTING, BLOCK_TYPE_SPRAY_PERMIT, MeshRoutingData, PathElement, PolicyMutation,
     StagedBundleDecision, TrebData, TrebHopEntry, encode_spray_permit,
 };
-use crate::engine::{RegoRoutingEngine, canonical_bundle_key, resolve_next_hop_eid};
+use crate::engine::{RegoRoutingEngine, resolve_next_hop_eid};
 use crate::policy::RegoDecision;
 
 hardy_bpa::slot!(pub static REGO_BUNDLE_DECISION: StagedBundleDecision);
@@ -99,8 +100,13 @@ impl Classifier for RegoIngressClassifier {
             match resolve_next_hop_eid(rk) {
                 Some(next_hop_eid) => {
                     delta.route_key = Some(next_hop_eid.clone());
-                    self.engine
-                        .request_dynamic_route(next_hop_eid.clone(), next_hop_eid);
+                    let action = match decision.route_action.as_deref() {
+                        Some("FORWARD_REPLICATE") => {
+                            RouteAction::ForwardReplicate(next_hop_eid.clone())
+                        }
+                        _ => RouteAction::Via(next_hop_eid.clone()),
+                    };
+                    self.engine.request_dynamic_action(next_hop_eid, action);
                 }
                 None => {
                     debug!("Ignoring unresolvable route_key '{rk}'");
@@ -146,6 +152,16 @@ impl Rewriter for RegoEgressRewriter {
             }
         };
 
+        if matches!(egress_decision.action.as_str(), "DROP" | "SKIP") {
+            warn!(
+                action = %egress_decision.action,
+                next_hop = %next_hop_eid,
+                reason = %egress_decision.reason,
+                "Rego egress policy returned DROP/SKIP; suppressing staged mutations (Hardy Rewriter cannot suppress forwarding)"
+            );
+            return;
+        }
+
         let mut all_mutations = staged.map(|s| s.ingress_mutations).unwrap_or_default();
         all_mutations.extend(egress_decision.mutations);
 
@@ -165,7 +181,7 @@ impl Rewriter for RegoEgressRewriter {
                     treb_entries.push(entry);
                 }
             } else {
-                apply_mutation(ctx, &self.engine, mutation);
+                apply_mutation(ctx, mutation);
             }
         }
         if !treb_entries.is_empty() {
@@ -174,15 +190,15 @@ impl Rewriter for RegoEgressRewriter {
     }
 }
 
-/// Constructs Hardy's unified [`FilterPack`] wiring the Rego Verifier, Classifier,
+/// Constructs Hardy's unified [`FilterPack`] wiring the Rego Classifier
 /// and Egress Rewriter into Hardy's BPA pipeline.
+///
+/// `RegoIngressClassifier` enforces fail-closed `Verdict::Drop` decisions and
+/// commits deduplication/routing state in a single pass, avoiding duplicate
+/// Rego evaluation per bundle.
 pub fn build_filter_pack(engine: Arc<RegoRoutingEngine>) -> FilterPack {
     let mut pack = FilterPack::new("dtnpm-rego-routing");
-    pack.ingress_verifier(
-        "rego-ingress-verifier",
-        RegoIngressVerifier::new(engine.clone()),
-    )
-    .ingress_classifier(
+    pack.ingress_classifier(
         "rego-ingress-classifier",
         RegoIngressClassifier::new(engine.clone()),
     )
@@ -221,11 +237,7 @@ fn find_block_by_type(ctx: &RewriteContext<'_>, target_type: u64) -> Option<(u64
     None
 }
 
-fn apply_mutation(
-    ctx: &mut RewriteContext<'_>,
-    engine: &RegoRoutingEngine,
-    mutation: &PolicyMutation,
-) {
+fn apply_mutation(ctx: &mut RewriteContext<'_>, mutation: &PolicyMutation) {
     match mutation.operation.as_str() {
         "SET_FIELD" => {
             // Hop Count Block (Type 10) is incremented by Hardy BPA's update_extension_blocks
@@ -235,7 +247,7 @@ fn apply_mutation(
                 mutation.block_type, mutation.field
             );
         }
-        "MUTATE_SPRAY_QUOTA" => apply_spray_quota_mutation(ctx, engine, mutation),
+        "MUTATE_SPRAY_QUOTA" => apply_spray_quota_mutation(ctx, mutation),
         "MUTATE_APRS_ALIAS" | "MUTATE_APRS_STRICT" => apply_aprs_mutation(ctx, mutation),
         other => {
             debug!("Ignoring unknown Rego mutation operation '{other}'");
@@ -243,11 +255,7 @@ fn apply_mutation(
     }
 }
 
-fn apply_spray_quota_mutation(
-    ctx: &mut RewriteContext<'_>,
-    engine: &RegoRoutingEngine,
-    mutation: &PolicyMutation,
-) {
+fn apply_spray_quota_mutation(ctx: &mut RewriteContext<'_>, mutation: &PolicyMutation) {
     let Some(tx_quota) = mutation.transmitted_quota else {
         return;
     };
@@ -272,17 +280,13 @@ fn apply_spray_quota_mutation(
             }
             Err(err) => warn!("Failed to decode Mesh Block {bn} during spray mutation: {err}"),
         }
-    } else if let Some((bn, _bytes)) = find_block_by_type(ctx, BLOCK_TYPE_SPRAY_PERMIT) {
+    }
+
+    if let Some((bn, _bytes)) = find_block_by_type(ctx, BLOCK_TYPE_SPRAY_PERMIT) {
         let encoded = encode_spray_permit(tx_quota);
         if let Err(err) = ctx.editor().replace(bn, encoded) {
             warn!("Failed to rewrite Spray Permit Block {bn}: {err}");
         }
-    }
-
-    if let Some(local_quota) = mutation.local_quota {
-        let key = canonical_bundle_key(ctx.bundle());
-        let _ = key;
-        engine.set_tracked_spray_quota(ctx.bundle(), local_quota);
     }
 }
 
@@ -310,6 +314,7 @@ fn apply_aprs_mutation(ctx: &mut RewriteContext<'_>, mutation: &PolicyMutation) 
         .to_string();
 
     let mut advance = false;
+    let mut changed = false;
     match (mutation.operation.as_str(), elem) {
         ("MUTATE_APRS_ALIAS", PathElement::Alias(alias)) => {
             alias.remaining_count = alias.remaining_count.saturating_sub(1);
@@ -320,12 +325,18 @@ fn apply_aprs_mutation(ctx: &mut RewriteContext<'_>, mutation: &PolicyMutation) 
                 alias.completed = true;
                 advance = true;
             }
+            changed = true;
         }
         ("MUTATE_APRS_STRICT", PathElement::Strict(strict)) => {
             strict.completed = true;
             advance = true;
+            changed = true;
         }
         _ => {}
+    }
+
+    if !changed {
+        return;
     }
 
     if advance {

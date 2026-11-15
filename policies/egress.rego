@@ -41,7 +41,7 @@ treb_departure_mutations := [
 
 peer_is_destination if {
 	input.contact.is_broadcast != true
-	input.contact.peer_eid == input.bundle.primary.destination
+	helpers.is_same_node(input.contact.peer_eid, input.bundle.primary.destination)
 }
 
 split_horizon_skip if {
@@ -64,6 +64,7 @@ spray_wait_active if {
 	not peer_is_destination
 	not split_horizon_skip
 	not hop_limit_drop
+	not aprs_strict_mismatch
 	helpers.has_spray_block(input.bundle)
 }
 
@@ -99,6 +100,48 @@ decision := {
 	"mutations": [],
 } if {
 	hop_limit_drop
+}
+
+aprs_expected_strict_next_hop(traj, node) := hop.target_id if {
+	hop := helpers.get_active_hop(traj)
+	helpers.is_strict_hop(hop)
+	not helpers.is_strict_match(hop, node)
+} else := next_hop.target_id if {
+	cur := helpers.get_active_hop(traj)
+	helpers.is_strict_hop(cur)
+	helpers.is_strict_match(cur, node)
+	idx := traj.active_hop_index + 1
+	idx < count(traj.path_elements)
+	next_hop := traj.path_elements[idx]
+	helpers.is_strict_hop(next_hop)
+}
+
+is_eid_string(s) if {
+	startswith(s, "dtn://")
+}
+
+is_eid_string(s) if {
+	startswith(s, "ipn:")
+}
+
+aprs_strict_mismatch if {
+	not peer_is_destination
+	not split_horizon_skip
+	not hop_limit_drop
+	helpers.has_aprs_trajectory(input.bundle)
+	traj := helpers.get_trajectory_payload(input.bundle)
+	expected := aprs_expected_strict_next_hop(traj, input.node)
+	is_eid_string(expected)
+	not helpers.is_same_node(expected, input.contact.peer_eid)
+}
+
+# 3b. APRS strict next-hop mismatch: skip peers not matching active strict target.
+decision := {
+	"action": "SKIP",
+	"reason": "Peer does not match active APRS strict next-hop",
+	"mutations": [],
+} if {
+	aprs_strict_mismatch
 }
 
 # 4. Spray-and-Wait: peer already holds a copy in its summary vector.
@@ -183,6 +226,7 @@ decision := {
 	not peer_is_destination
 	not split_horizon_skip
 	not hop_limit_drop
+	not aprs_strict_mismatch
 	not spray_wait_active
 	helpers.has_aprs_trajectory(input.bundle)
 	input.contact.is_broadcast == true
@@ -196,6 +240,7 @@ decision := {
 	not peer_is_destination
 	not split_horizon_skip
 	not hop_limit_drop
+	not aprs_strict_mismatch
 	not spray_wait_active
 	helpers.has_aprs_trajectory(input.bundle)
 	input.contact.is_broadcast != true

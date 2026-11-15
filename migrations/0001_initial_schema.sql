@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS rego_policy_config (
     treb_block_type INTEGER NOT NULL DEFAULT 201,
     custom_ingress_rego TEXT,
     custom_egress_rego TEXT,
+    custom_routing_rego TEXT,
     updated_at INTEGER NOT NULL,
     updated_by TEXT NOT NULL DEFAULT 'system'
 );

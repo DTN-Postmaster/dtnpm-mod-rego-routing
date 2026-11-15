@@ -66,6 +66,41 @@ is_source_blacklisted(source_eid, node) if {
 	eid_matches_pattern(source_eid, pattern)
 }
 
+# Returns true if two EIDs refer to the same DTN/IPN node (e.g. ipn:0.99.0 == ipn:0.99.1, dtn://statc/ == dtn://statc/files).
+is_same_node(eid_a, eid_b) if {
+	eid_a == eid_b
+}
+
+is_same_node(eid_a, eid_b) if {
+	startswith(eid_a, "dtn://")
+	startswith(eid_b, "dtn://")
+	node_a := split(trim_prefix(eid_a, "dtn://"), "/")[0]
+	node_b := split(trim_prefix(eid_b, "dtn://"), "/")[0]
+	node_a != ""
+	node_a == node_b
+}
+
+is_same_node(eid_a, eid_b) if {
+	startswith(eid_a, "ipn:")
+	startswith(eid_b, "ipn:")
+	parts_a := split(trim_prefix(eid_a, "ipn:"), ".")
+	parts_b := split(trim_prefix(eid_b, "ipn:"), ".")
+	count(parts_a) == 3
+	count(parts_b) == 3
+	parts_a[0] == parts_b[0]
+	parts_a[1] == parts_b[1]
+}
+
+is_same_node(eid_a, eid_b) if {
+	startswith(eid_a, "ipn:")
+	startswith(eid_b, "ipn:")
+	parts_a := split(trim_prefix(eid_a, "ipn:"), ".")
+	parts_b := split(trim_prefix(eid_b, "ipn:"), ".")
+	count(parts_a) == 2
+	count(parts_b) == 2
+	parts_a[0] == parts_b[0]
+}
+
 # Returns all EIDs owned by the local BPA node.
 is_local_destination(dest_eid, node) if {
 	dest_eid == node.local_eid
@@ -295,4 +330,9 @@ is_storm_or_loop(bundle, node) if {
 
 is_storm_or_loop(bundle, node) if {
 	is_aprs_loop_or_trap(bundle, node)
+}
+
+# Checks whether a neighbor peer is not blacklisted on the local node.
+peer_allowed(peer, node) if {
+	not is_source_blacklisted(peer.peer_eid, node)
 }

@@ -24,12 +24,14 @@ export interface PolicyStatusResponse {
     active_profile: string;
     custom_ingress_rego?: string | null;
     custom_egress_rego?: string | null;
+    custom_routing_rego?: string | null;
   };
   sources: {
     constants: string;
     helpers: string;
     ingress: string;
     egress: string;
+    routing: string;
   };
 }
 
@@ -60,6 +62,7 @@ export function RegoRoutingTab() {
   const [trebBlockType, setTrebBlockType] = useState(201);
   const [customIngress, setCustomIngress] = useState('');
   const [customEgress, setCustomEgress] = useState('');
+  const [customRouting, setCustomRouting] = useState('');
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -86,6 +89,7 @@ export function RegoRoutingTab() {
       setTrebBlockType(polData.config.treb_block_type);
       setCustomIngress(polData.config.custom_ingress_rego ?? polData.sources.ingress);
       setCustomEgress(polData.config.custom_egress_rego ?? polData.sources.egress);
+      setCustomRouting(polData.config.custom_routing_rego ?? polData.sources.routing);
       setDecisions(decData);
     } catch (e) {
       setError(String(e));
@@ -174,6 +178,7 @@ export function RegoRoutingTab() {
             treb_block_type: Number(trebBlockType),
             custom_ingress_rego: customIngress,
             custom_egress_rego: customEgress,
+            custom_routing_rego: customRouting,
           };
 
       const res = await fetch(`${API_BASE}/policy`, {
@@ -200,9 +205,16 @@ export function RegoRoutingTab() {
 
   const handleClearDecisions = async () => {
     setBusy(true);
+    setError(null);
     try {
-      await fetch(`${API_BASE}/decisions/clear`, { method: 'POST' });
+      const res = await fetch(`${API_BASE}/decisions/clear`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${res.status}`);
+      }
       await loadAll();
+    } catch (err) {
+      setError(String(err));
     } finally {
       setBusy(false);
     }
@@ -393,7 +405,7 @@ export function RegoRoutingTab() {
           </div>
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div>
             <label class="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
               ingress.rego (`package dtn.ingress`)
@@ -416,6 +428,17 @@ export function RegoRoutingTab() {
               class="w-full p-2 font-mono text-xs rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
             />
           </div>
+          <div>
+            <label class="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
+              routing.rego (`package dtn.routing`)
+            </label>
+            <textarea
+              rows={12}
+              value={customRouting}
+              onInput={(e) => setCustomRouting((e.target as HTMLTextAreaElement).value)}
+              class="w-full p-2 font-mono text-xs rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
+            />
+          </div>
         </div>
       </section>
 
@@ -428,15 +451,17 @@ export function RegoRoutingTab() {
           <div class="flex gap-2">
             <button
               type="button"
+              disabled={busy}
               onClick={loadAll}
-              class="px-3 py-1 text-xs rounded-lg border border-slate-300 dark:border-slate-600"
+              class="px-3 py-1 text-xs rounded-lg border border-slate-300 dark:border-slate-600 disabled:opacity-50"
             >
               Rafraîchir
             </button>
             <button
               type="button"
+              disabled={busy}
               onClick={handleClearDecisions}
-              class="px-3 py-1 text-xs rounded-lg border border-slate-300 dark:border-slate-600 text-rose-600"
+              class="px-3 py-1 text-xs rounded-lg border border-slate-300 dark:border-slate-600 text-rose-600 disabled:opacity-50"
             >
               Effacer
             </button>

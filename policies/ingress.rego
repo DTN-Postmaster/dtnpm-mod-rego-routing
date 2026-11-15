@@ -157,6 +157,8 @@ aprs_next_strict_target(traj) := target if {
 	not helpers.is_strict_match(hop, input.node)
 	target := hop.target_id
 } else := target if {
+	cur := traj.path_elements[traj.active_hop_index]
+	aprs_hop_completed_here(cur)
 	idx := traj.active_hop_index + 1
 	idx < count(traj.path_elements)
 	next_hop := traj.path_elements[idx]
@@ -165,10 +167,18 @@ aprs_next_strict_target(traj) := target if {
 } else := input.bundle.primary.destination if {
 	idx := traj.active_hop_index
 	hop := traj.path_elements[idx]
-	helpers.is_strict_match(hop, input.node)
+	aprs_hop_completed_here(hop)
 	(idx + 1) >= count(traj.path_elements)
 	not helpers.is_local_destination(input.bundle.primary.destination, input.node)
 } else := null
+
+aprs_hop_completed_here(hop) if {
+	helpers.is_strict_match(hop, input.node)
+} else if {
+	helpers.is_alias_hop(hop)
+	hop.remaining_count <= 1
+	helpers.is_alias_supported(hop.scope_name, input.node)
+}
 
 aprs_can_service_alias if {
 	helpers.has_aprs_trajectory(input.bundle)

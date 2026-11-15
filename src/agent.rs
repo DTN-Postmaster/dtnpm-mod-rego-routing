@@ -1,18 +1,20 @@
 //! Hardy BPA [`RoutingAgent`] implementation driven by the Rego routing engine,
-//! including dynamic route management helpers prepared for Hardy `feat/spray-n-wait`.
+//! including dynamic `RouteAction::Via` and `RouteAction::ForwardReplicate`
+//! route management for APRS and Spray-and-Wait (Hardy `main-dtnpm`).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use hardy_async::async_trait;
 use hardy_bpa::routing::{RouteAction, RoutingAgent, RoutingSink};
-use hardy_bpv7::{eid::Eid, eid::NodeId};
+use hardy_bpv7::{bundle::Bundle, eid::Eid, eid::NodeId, status_report::ReasonCode};
 use hardy_eid_patterns::EidPattern;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::engine::RegoRoutingEngine;
+use crate::engine::{DynamicRouteCommand, RegoRoutingEngine, resolve_next_hop_eid};
 use crate::error::RegoRoutingError;
+use crate::policy::DesiredRoute;
 
 /// Default RIB priority used for Rego-managed routes (lower takes precedence if needed,
 /// using standard moderate priority `100`).
@@ -23,6 +25,7 @@ pub const DEFAULT_REGO_ROUTE_PRIORITY: u32 = 100;
 pub struct RegoRoutingAgent {
     engine: Arc<RegoRoutingEngine>,
     sink: RwLock<Option<Arc<dyn RoutingSink>>>,
+    stop_tx: RwLock<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 impl std::fmt::Debug for RegoRoutingAgent {
@@ -37,6 +40,7 @@ impl RegoRoutingAgent {
         Self {
             engine,
             sink: RwLock::new(None),
+            stop_tx: RwLock::new(None),
         }
     }
 
@@ -76,8 +80,9 @@ impl RegoRoutingAgent {
             .map_err(|e| RegoRoutingError::InvalidConfig(format!("RIB remove_route failed: {e}")))
     }
 
-    /// Helper registering a peer next-hop route for Spray-and-Wait dissemination
-    /// (compatible with `hardy` `feat/spray-n-wait` relay contacts).
+    /// Registers an opportunistic `RouteAction::ForwardReplicate` route for
+    /// Spray-and-Wait dissemination so Hardy BPA retains the bundle in storage
+    /// after forwarding copies to relay contacts.
     pub async fn add_spray_route(
         &self,
         destination_pattern: EidPattern,
@@ -86,13 +91,32 @@ impl RegoRoutingAgent {
     ) -> Result<bool, RegoRoutingError> {
         self.upsert_route(
             destination_pattern,
-            RouteAction::Via(next_hop),
+            RouteAction::ForwardReplicate(next_hop),
             priority.unwrap_or(DEFAULT_REGO_ROUTE_PRIORITY),
         )
         .await
     }
 
-    /// Helper removing a Spray-and-Wait peer route.
+    /// Registers an opportunistic `RouteAction::ForwardReplicate` route for
+    /// `bundle` only if its tracked Spray-and-Wait permit quota is still in the
+    /// Spray phase (`L > 1`). Returns `Ok(false)` when in the Wait phase (`L <= 1`).
+    pub async fn add_spray_route_for_bundle(
+        &self,
+        destination_pattern: EidPattern,
+        next_hop: Eid,
+        bundle: &Bundle,
+        priority: Option<u32>,
+    ) -> Result<bool, RegoRoutingError> {
+        if let Some(quota) = self.engine.tracked_spray_quota(bundle)
+            && quota <= 1
+        {
+            return Ok(false);
+        }
+        self.add_spray_route(destination_pattern, next_hop, priority)
+            .await
+    }
+
+    /// Removes a Spray-and-Wait `RouteAction::ForwardReplicate` peer route.
     pub async fn remove_spray_route(
         &self,
         destination_pattern: &EidPattern,
@@ -101,7 +125,7 @@ impl RegoRoutingAgent {
     ) -> Result<bool, RegoRoutingError> {
         self.remove_route(
             destination_pattern,
-            &RouteAction::Via(next_hop),
+            &RouteAction::ForwardReplicate(next_hop),
             priority.unwrap_or(DEFAULT_REGO_ROUTE_PRIORITY),
         )
         .await
@@ -123,37 +147,105 @@ impl RoutingAgent for RegoRoutingAgent {
             *guard = Some(sink_arc.clone());
         }
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Eid, Eid)>(256);
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut guard = self.stop_tx.write().await;
+            *guard = Some(stop_tx);
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DynamicRouteCommand>(256);
         self.engine.set_route_sender(tx);
+        let cmd_sink = sink_arc.clone();
         tokio::spawn(async move {
-            let mut installed: HashSet<(Eid, Eid)> = HashSet::new();
-            while let Some((pattern_eid, next_hop_eid)) = rx.recv().await {
-                if !installed.insert((pattern_eid.clone(), next_hop_eid.clone())) {
-                    continue;
-                }
-                let pattern: EidPattern = pattern_eid.clone().into();
-                match sink_arc
-                    .add_route(
-                        pattern.clone(),
-                        RouteAction::Via(next_hop_eid.clone()),
-                        DEFAULT_REGO_ROUTE_PRIORITY,
-                    )
-                    .await
-                {
-                    Ok(added) => {
-                        info!(
-                            pattern = %pattern,
-                            next_hop = %next_hop_eid,
-                            added,
-                            "RegoRoutingAgent installed dynamic Via route from Rego decision"
-                        );
+            const MAX_INSTALLED_ROUTES: usize = 4096;
+            let mut installed: HashSet<(Eid, RouteAction)> = HashSet::new();
+            let mut order: std::collections::VecDeque<(Eid, RouteAction)> =
+                std::collections::VecDeque::new();
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    DynamicRouteCommand::Add {
+                        pattern: pattern_eid,
+                        action,
+                    } => {
+                        let key = (pattern_eid.clone(), action.clone());
+                        if !installed.insert(key.clone()) {
+                            continue;
+                        }
+                        order.push_back(key);
+                        if order.len() > MAX_INSTALLED_ROUTES
+                            && let Some(oldest) = order.pop_front()
+                        {
+                            installed.remove(&oldest);
+                        }
+                        let pattern: EidPattern = pattern_eid.into();
+                        match cmd_sink
+                            .add_route(pattern.clone(), action.clone(), DEFAULT_REGO_ROUTE_PRIORITY)
+                            .await
+                        {
+                            Ok(added) => {
+                                info!(
+                                    pattern = %pattern,
+                                    action = %action,
+                                    added,
+                                    "RegoRoutingAgent installed dynamic route from Rego decision"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    pattern = %pattern,
+                                    action = %action,
+                                    "RegoRoutingAgent failed to add dynamic route: {err}"
+                                );
+                            }
+                        }
                     }
-                    Err(err) => {
-                        warn!(
-                            pattern = %pattern,
-                            next_hop = %next_hop_eid,
-                            "RegoRoutingAgent failed to add dynamic Via route: {err}"
-                        );
+                    DynamicRouteCommand::Remove {
+                        pattern: pattern_eid,
+                        action,
+                    } => {
+                        let key = (pattern_eid.clone(), action.clone());
+                        installed.remove(&key);
+                        let pattern: EidPattern = pattern_eid.into();
+                        match cmd_sink
+                            .remove_route(&pattern, &action, DEFAULT_REGO_ROUTE_PRIORITY)
+                            .await
+                        {
+                            Ok(removed) => {
+                                info!(
+                                    pattern = %pattern,
+                                    action = %action,
+                                    removed,
+                                    "RegoRoutingAgent removed dynamic route"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    pattern = %pattern,
+                                    action = %action,
+                                    "RegoRoutingAgent failed to remove dynamic route: {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let engine = self.engine.clone();
+        let notify = engine.reconcile_notifier();
+        tokio::spawn(async move {
+            let mut active_routes: HashSet<(EidPattern, RouteAction, u32)> = HashSet::new();
+            reconcile_routing_table(&engine, &sink_arc, &mut active_routes).await;
+
+            loop {
+                tokio::select! {
+                    _ = notify.notified() => {
+                        reconcile_routing_table(&engine, &sink_arc, &mut active_routes).await;
+                    }
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
                     }
                 }
             }
@@ -161,9 +253,126 @@ impl RoutingAgent for RegoRoutingAgent {
     }
 
     async fn on_unregister(&self) {
+        self.engine.clear_route_sender();
+        if let Some(tx) = self.stop_tx.write().await.take() {
+            let _ = tx.send(true);
+        }
         let mut guard = self.sink.write().await;
         if guard.take().is_some() {
             warn!("RegoRoutingAgent unregistered from Hardy BPA");
         }
     }
+}
+
+fn parse_desired_route(desired: &DesiredRoute) -> Option<(EidPattern, RouteAction, u32)> {
+    let pattern: EidPattern = match desired.pattern.parse() {
+        Ok(p) => p,
+        Err(err) => {
+            warn!(
+                pattern = %desired.pattern,
+                "Ignoring invalid Rego routing pattern: {err}"
+            );
+            return None;
+        }
+    };
+
+    let action = match desired.action.to_ascii_uppercase().as_str() {
+        "FORWARD_REPLICATE" => {
+            let hop_str = desired.next_hop.as_deref()?;
+            let hop = resolve_next_hop_eid(hop_str)?;
+            RouteAction::ForwardReplicate(hop)
+        }
+        "VIA" => {
+            let hop_str = desired.next_hop.as_deref()?;
+            let hop = resolve_next_hop_eid(hop_str)?;
+            RouteAction::Via(hop)
+        }
+        "REFLECT" => RouteAction::Reflect,
+        "DROP" => {
+            let reason = desired
+                .reason_code
+                .and_then(|c| ReasonCode::try_from(c).ok());
+            RouteAction::Drop(reason)
+        }
+        other => {
+            warn!("Ignoring unknown Rego routing action '{other}'");
+            return None;
+        }
+    };
+
+    Some((pattern, action, desired.priority))
+}
+
+async fn reconcile_routing_table(
+    engine: &RegoRoutingEngine,
+    sink: &Arc<dyn RoutingSink>,
+    active: &mut HashSet<(EidPattern, RouteAction, u32)>,
+) {
+    let desired_list = match engine.evaluate_routing_table() {
+        Ok(list) => list,
+        Err(err) => {
+            warn!("Rego routing.rego evaluation failed: {err}");
+            return;
+        }
+    };
+
+    let mut desired_set: HashSet<(EidPattern, RouteAction, u32)> = HashSet::new();
+    for item in &desired_list {
+        if let Some(parsed) = parse_desired_route(item) {
+            desired_set.insert(parsed);
+        }
+    }
+
+    let to_remove: Vec<(EidPattern, RouteAction, u32)> =
+        active.difference(&desired_set).cloned().collect();
+    for (pattern, action, priority) in &to_remove {
+        match sink.remove_route(pattern, action, *priority).await {
+            Ok(removed) => {
+                info!(
+                    pattern = %pattern,
+                    action = %action,
+                    priority,
+                    removed,
+                    "RegoRoutingAgent removed declarative routing.rego route"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    pattern = %pattern,
+                    action = %action,
+                    priority,
+                    "RegoRoutingAgent failed to remove declarative route: {err}"
+                );
+            }
+        }
+    }
+
+    let to_add: Vec<(EidPattern, RouteAction, u32)> =
+        desired_set.difference(active).cloned().collect();
+    for (pattern, action, priority) in &to_add {
+        match sink
+            .add_route(pattern.clone(), action.clone(), *priority)
+            .await
+        {
+            Ok(added) => {
+                info!(
+                    pattern = %pattern,
+                    action = %action,
+                    priority,
+                    added,
+                    "RegoRoutingAgent installed declarative routing.rego route"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    pattern = %pattern,
+                    action = %action,
+                    priority,
+                    "RegoRoutingAgent failed to add declarative route: {err}"
+                );
+            }
+        }
+    }
+
+    *active = desired_set;
 }
