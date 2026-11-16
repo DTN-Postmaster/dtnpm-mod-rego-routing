@@ -16,6 +16,7 @@ pub mod engine;
 pub mod error;
 pub mod filter;
 pub mod policy;
+pub mod rib;
 pub mod routes;
 
 pub use agent::RegoRoutingAgent;
@@ -28,7 +29,8 @@ pub use filter::{
     REGO_BUNDLE_DECISION, RegoEgressRewriter, RegoIngressClassifier, RegoIngressVerifier,
     build_filter_pack,
 };
-pub use policy::{DesiredRoute, PolicySources, PolicySuite, RegoDecision};
+pub use policy::{DesiredRoute, PolicySources, PolicySuite, RegoDecision, RibDecision};
+pub use rib::RegoRib;
 
 use crate::routes::RegoRouteState;
 

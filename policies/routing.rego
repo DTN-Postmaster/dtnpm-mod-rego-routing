@@ -21,6 +21,17 @@ import data.dtn.helpers
 #   }
 default routes := []
 
+# Optional per-bundle routing decision evaluated by `RegoRib::decide(&bundle)`.
+# Returns null (or {"action": "FALLBACK"}) to delegate to DefaultRib.
+# Otherwise returns:
+#   {
+#     "action": "FORWARD" | "FORWARD_REPLICATE" | "WAIT" | "DROP" | "FALLBACK",
+#     "next_hop": peer.peer_eid,   # required for FORWARD / FORWARD_REPLICATE
+#     "retain": false,             # optional, defaults to false (true for FORWARD_REPLICATE)
+#     "reason_code": 6             # optional, for DROP
+#   }
+default decide := null
+
 # Example helper: check whether a neighbor peer is not blacklisted.
 peer_allowed(peer) if {
 	helpers.peer_allowed(peer, input.node)

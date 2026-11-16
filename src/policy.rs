@@ -26,6 +26,7 @@ pub const EMBEDDED_ROUTING_REGO: &str = include_str!("../policies/routing.rego")
 const INGRESS_ENTRYPOINT: &str = "data.dtn.ingress.decision";
 const EGRESS_ENTRYPOINT: &str = "data.dtn.egress.decision";
 const ROUTING_ENTRYPOINT: &str = "data.dtn.routing.routes";
+const RIB_DECIDE_ENTRYPOINT: &str = "data.dtn.routing.decide";
 
 /// Maximum accepted size of an inline or file-based Rego policy (256 KiB).
 pub const MAX_POLICY_BYTES: usize = 256 * 1024;
@@ -182,12 +183,28 @@ pub struct DesiredRoute {
     pub reason_code: Option<u64>,
 }
 
+/// Per-bundle routing decision evaluated by `RegoRib::decide` from `data.dtn.routing.decide`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RibDecision {
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_hop: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<u64>,
+}
+
 /// Thread-safe compiled OPA/Rego policy suite (ingress + egress + routing).
 #[derive(Clone)]
 pub struct PolicySuite {
     ingress: regorus::CompiledPolicy,
     egress: regorus::CompiledPolicy,
     routing: regorus::CompiledPolicy,
+    rib_decide: Option<regorus::CompiledPolicy>,
+    has_custom_decide: bool,
     sources: PolicySources,
 }
 
@@ -207,10 +224,33 @@ impl PolicySuite {
         let ingress = compile_entrypoint(&sources, INGRESS_ENTRYPOINT)?;
         let egress = compile_entrypoint(&sources, EGRESS_ENTRYPOINT)?;
         let routing = compile_entrypoint(&sources, ROUTING_ENTRYPOINT)?;
+        let rib_decide = match compile_entrypoint(&sources, RIB_DECIDE_ENTRYPOINT) {
+            Ok(policy) => Some(policy),
+            Err(err) => {
+                // Allow legacy custom routing.rego files that omit `default decide := null`.
+                let mentions_decide = sources
+                    .routing
+                    .lines()
+                    .any(|l| !l.trim_start().starts_with('#') && l.contains("decide"));
+                if mentions_decide {
+                    return Err(err);
+                }
+                None
+            }
+        };
+        let has_custom_decide = rib_decide.is_some()
+            && sources.routing.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with('#')
+                    && trimmed.contains("decide")
+                    && trimmed != "default decide := null"
+            });
         Ok(Self {
             ingress,
             egress,
             routing,
+            rib_decide,
+            has_custom_decide,
             sources,
         })
     }
@@ -242,6 +282,25 @@ impl PolicySuite {
         input: &serde_json::Value,
     ) -> Result<Vec<DesiredRoute>, RegoRoutingError> {
         eval_compiled_json(&self.routing, input)
+    }
+
+    /// Returns whether `routing.rego` defines a non-default per-bundle `decide` rule.
+    pub fn has_custom_decide(&self) -> bool {
+        self.has_custom_decide
+    }
+
+    /// Evaluates optional per-bundle `data.dtn.routing.decide` against a bundle/neighbor/node context.
+    pub fn evaluate_rib_decide(
+        &self,
+        input: &serde_json::Value,
+    ) -> Result<Option<RibDecision>, RegoRoutingError> {
+        if !self.has_custom_decide {
+            return Ok(None);
+        }
+        let Some(policy) = &self.rib_decide else {
+            return Ok(None);
+        };
+        eval_compiled_json(policy, input)
     }
 }
 

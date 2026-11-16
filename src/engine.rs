@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use hardy_bpa::bundle::BundleMetadata;
@@ -22,7 +23,7 @@ use crate::blocks::{
     decode_cbor_to_json, decode_spray_permit,
 };
 use crate::error::RegoRoutingError;
-use crate::policy::{DesiredRoute, PolicySources, PolicySuite, RegoDecision};
+use crate::policy::{DesiredRoute, PolicySources, PolicySuite, RegoDecision, RibDecision};
 
 /// Maximum accepted EID pattern length (anti-DoS / SQLite hygiene).
 pub const MAX_EID_PATTERN_LEN: usize = 256;
@@ -262,6 +263,26 @@ struct RegoRoutingState {
     route_tx: Option<tokio::sync::mpsc::Sender<DynamicRouteCommand>>,
     peers: HashMap<(String, String), Vec<NeighborPeer>>,
     reconcile_notify: Arc<tokio::sync::Notify>,
+    rib_policy_notify: Arc<tokio::sync::Notify>,
+    policy_version: Arc<AtomicU64>,
+}
+
+impl RegoRoutingState {
+    fn enabled_blacklist_sources(&self) -> Vec<String> {
+        self.blacklist
+            .iter()
+            .filter(|b| b.enabled)
+            .map(|b| b.eid_pattern.clone())
+            .collect()
+    }
+
+    fn bump_policy_version(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        self.policy_version.fetch_add(1, Ordering::Release);
+        (
+            self.reconcile_notify.clone(),
+            self.rib_policy_notify.clone(),
+        )
+    }
 }
 
 /// Thread-safe facade used concurrently by Hardy BPA pipeline filters and the REST API.
@@ -301,6 +322,8 @@ impl RegoRoutingEngine {
                 route_tx: None,
                 peers: HashMap::new(),
                 reconcile_notify: Arc::new(tokio::sync::Notify::new()),
+                rib_policy_notify: Arc::new(tokio::sync::Notify::new()),
+                policy_version: Arc::new(AtomicU64::new(0)),
             })),
         })
     }
@@ -310,6 +333,19 @@ impl RegoRoutingEngine {
     pub fn reconcile_notifier(&self) -> Arc<tokio::sync::Notify> {
         let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
         guard.reconcile_notify.clone()
+    }
+
+    /// Returns the [`tokio::sync::Notify`] handle signaled whenever blacklist rules
+    /// or Rego policies change (dedicated to `RegoRib::start`).
+    pub fn rib_policy_notifier(&self) -> Arc<tokio::sync::Notify> {
+        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
+        guard.rib_policy_notify.clone()
+    }
+
+    /// Returns the monotonic policy/blacklist version counter for `RegoRib` snapshots.
+    pub fn policy_version(&self) -> u64 {
+        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
+        guard.policy_version.load(Ordering::Acquire)
     }
 
     /// Records or updates connected neighbor peers for `(cla_name, cla_addr)` and
@@ -373,12 +409,7 @@ impl RegoRoutingEngine {
     pub fn evaluate_routing_table(&self) -> Result<Vec<DesiredRoute>, RegoRoutingError> {
         let (suite, config, blacklist_sources, peers) = {
             let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
-            let blacklist_sources: Vec<String> = guard
-                .blacklist
-                .iter()
-                .filter(|b| b.enabled)
-                .map(|b| b.eid_pattern.clone())
-                .collect();
+            let blacklist_sources = guard.enabled_blacklist_sources();
             let mut peers: Vec<NeighborPeer> = guard.peers.values().flatten().cloned().collect();
             peers.sort_by(|a, b| a.peer_eid.cmp(&b.peer_eid));
             (
@@ -390,23 +421,101 @@ impl RegoRoutingEngine {
         };
 
         let input = serde_json::json!({
-            "node": {
-                "local_eid": config.local_eid,
-                "node_eids": config.node_eids,
-                "callsign": config.callsign.as_deref().unwrap_or(""),
-                "is_digipeater": config.is_digipeater,
-                "supported_aliases": config.supported_aliases,
-                "trapped_aliases": config.trapped_aliases,
-                "hop_limit": config.hop_limit,
-                "treb_block_type": config.treb_block_type,
-                "record_treb": config.record_treb,
-                "blacklist_sources": blacklist_sources,
-            },
+            "node": build_routing_node_json(&config, &blacklist_sources),
             "peers": peers,
             "current_dtn_time_ms": DtnTime::now().millisecs(),
         });
 
         suite.evaluate_routing(&input)
+    }
+
+    /// Evaluates per-bundle `data.dtn.routing.decide` for `RegoRib::decide`.
+    pub fn evaluate_rib_decide(
+        &self,
+        bundle: &hardy_bpa::bundle::Bundle,
+        connected_peers: &[(NodeId, u32)],
+    ) -> Result<Option<RibDecision>, RegoRoutingError> {
+        let bundle_id_str = bundle.bpv7.primary.id.to_string();
+        let (suite, config, blacklist_sources, neighbor_peers, spray_quota) = {
+            let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
+            if !guard.suite.has_custom_decide() {
+                return Ok(None);
+            }
+            let blacklist_sources = guard.enabled_blacklist_sources();
+            let neighbor_peers: Vec<NeighborPeer> =
+                guard.peers.values().flatten().cloned().collect();
+            let spray_quota = guard.spray_tracker.get(&bundle_id_str);
+            (
+                guard.suite.clone(),
+                guard.config.clone(),
+                blacklist_sources,
+                neighbor_peers,
+                spray_quota,
+            )
+        };
+
+        let mut peers_json: Vec<serde_json::Value> = connected_peers
+            .iter()
+            .map(|(node_id, peer_id)| {
+                let peer_eid = Eid::from(node_id.clone()).to_string();
+                let meta = neighbor_peers.iter().find(|p| p.peer_eid == peer_eid);
+                serde_json::json!({
+                    "peer_eid": peer_eid,
+                    "node_id": node_id.to_string(),
+                    "peer_id": peer_id,
+                    "cla_name": meta.map(|m| m.cla_name.as_str()).unwrap_or(""),
+                    "cla_addr": meta.map(|m| m.cla_addr.as_str()).unwrap_or(""),
+                })
+            })
+            .collect();
+        peers_json.sort_by(|a, b| {
+            let ea = a.get("peer_eid").and_then(|v| v.as_str()).unwrap_or("");
+            let eb = b.get("peer_eid").and_then(|v| v.as_str()).unwrap_or("");
+            ea.cmp(eb)
+        });
+
+        let payload_len = bundle
+            .bpv7
+            .blocks
+            .get(&1)
+            .map(|b| b.data.end.saturating_sub(b.data.start))
+            .unwrap_or(0);
+        let block_types: Vec<u64> = bundle
+            .bpv7
+            .blocks
+            .values()
+            .map(|b| u64::from(b.block_type))
+            .collect();
+        let staged_decision = bundle.metadata.slot(&crate::filter::REGO_BUNDLE_DECISION);
+        let route_key = staged_decision
+            .as_ref()
+            .and_then(|s| s.selected_route_key.clone());
+        let previous_node = bundle
+            .metadata
+            .extensions
+            .previous_node
+            .as_ref()
+            .map(ToString::to_string);
+
+        let input = serde_json::json!({
+            "bundle": {
+                "id": bundle_id_str,
+                "source": bundle.bpv7.primary.id.source.to_string(),
+                "destination": bundle.bpv7.primary.destination.to_string(),
+                "report_to": bundle.bpv7.primary.report_to.to_string(),
+                "route_key": route_key,
+                "payload_len": payload_len,
+                "block_types": block_types,
+                "previous_node": previous_node,
+                "staged_decision": staged_decision,
+                "spray_quota": spray_quota,
+            },
+            "peers": peers_json,
+            "node": build_routing_node_json(&config, &blacklist_sources),
+            "current_dtn_time_ms": DtnTime::now().millisecs(),
+        });
+
+        suite.evaluate_rib_decide(&input)
     }
 
     /// Registers the channel used by [`crate::filter::RegoIngressClassifier`] to ask [`crate::agent::RegoRoutingAgent`]
@@ -464,17 +573,18 @@ impl RegoRoutingEngine {
 
     /// Replaces the entire in-memory blacklist (typically after SQLite load).
     pub fn replace_blacklist(&self, entries: Vec<BlacklistEntry>) {
-        let notify = {
+        let (reconcile_notify, rib_notify) = {
             let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
             guard.blacklist = entries;
-            guard.reconcile_notify.clone()
+            guard.bump_policy_version()
         };
-        notify.notify_one();
+        reconcile_notify.notify_one();
+        rib_notify.notify_one();
     }
 
     /// Inserts or replaces an entry in the live blacklist.
     pub fn upsert_blacklist_entry(&self, entry: BlacklistEntry) {
-        let notify = {
+        let (reconcile_notify, rib_notify) = {
             let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
             if let Some(existing) = guard
                 .blacklist
@@ -485,31 +595,31 @@ impl RegoRoutingEngine {
             } else {
                 guard.blacklist.insert(0, entry);
             }
-            guard.reconcile_notify.clone()
+            guard.bump_policy_version()
         };
-        notify.notify_one();
+        reconcile_notify.notify_one();
+        rib_notify.notify_one();
     }
 
     /// Removes a blacklist entry by `id`, returning `true` if found.
     pub fn remove_blacklist_entry(&self, id: &str) -> bool {
-        let (removed, notify) = {
+        let (removed, reconcile_notify, rib_notify) = {
             let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
             let before = guard.blacklist.len();
             guard.blacklist.retain(|e| e.id != id);
-            (
-                guard.blacklist.len() != before,
-                guard.reconcile_notify.clone(),
-            )
+            let (rn, rbn) = guard.bump_policy_version();
+            (guard.blacklist.len() != before, rn, rbn)
         };
         if removed {
-            notify.notify_one();
+            reconcile_notify.notify_one();
+            rib_notify.notify_one();
         }
         removed
     }
 
     /// Updates `enabled` on an existing blacklist entry, returning `true` if found.
     pub fn set_blacklist_enabled(&self, id: &str, enabled: bool) -> bool {
-        let (updated, notify) = {
+        let (updated, reconcile_notify, rib_notify) = {
             let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
             let updated = if let Some(entry) = guard.blacklist.iter_mut().find(|e| e.id == id) {
                 entry.enabled = enabled;
@@ -517,10 +627,12 @@ impl RegoRoutingEngine {
             } else {
                 false
             };
-            (updated, guard.reconcile_notify.clone())
+            let (rn, rbn) = guard.bump_policy_version();
+            (updated, rn, rbn)
         };
         if updated {
-            notify.notify_one();
+            reconcile_notify.notify_one();
+            rib_notify.notify_one();
         }
         updated
     }
@@ -605,7 +717,7 @@ impl RegoRoutingEngine {
         )?;
         let compiled = PolicySuite::compile(sources)?;
 
-        let notify = {
+        let (reconcile_notify, rib_notify) = {
             let mut guard = self.state.write().unwrap_or_else(|e| e.into_inner());
             guard.config.active_profile = active_profile;
             guard.config.hop_limit = hop_limit;
@@ -614,9 +726,10 @@ impl RegoRoutingEngine {
             guard.config.custom_egress_rego = custom_egress_rego;
             guard.config.custom_routing_rego = custom_routing_rego;
             guard.suite = compiled;
-            guard.reconcile_notify.clone()
+            guard.bump_policy_version()
         };
-        notify.notify_one();
+        reconcile_notify.notify_one();
+        rib_notify.notify_one();
         Ok(())
     }
 
@@ -1066,5 +1179,23 @@ pub fn build_bundle_json<'a>(
             },
         },
         "extension_blocks": extension_blocks,
+    })
+}
+
+fn build_routing_node_json(
+    config: &RegoRoutingConfig,
+    blacklist_sources: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "local_eid": config.local_eid,
+        "node_eids": config.node_eids,
+        "callsign": config.callsign.as_deref().unwrap_or(""),
+        "is_digipeater": config.is_digipeater,
+        "supported_aliases": config.supported_aliases,
+        "trapped_aliases": config.trapped_aliases,
+        "hop_limit": config.hop_limit,
+        "treb_block_type": config.treb_block_type,
+        "record_treb": config.record_treb,
+        "blacklist_sources": blacklist_sources,
     })
 }
