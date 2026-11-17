@@ -1,12 +1,12 @@
-# Contribuer à `dtnpm-mod-rego-routing`
+# Contributing to `dtnpm-mod-rego-routing`
 
-1. Installez les hooks Git locaux :
+1. Install local Git hooks:
    ```bash
    ./scripts/install-hooks.sh
    ```
-2. Respectez les conventions de style (`cargo fmt`) et la politique zéro-`unwrap` dans `src/`.
-3. Ajoutez des tests unitaires Rego dans `tests/rego_policies_test.rs` et/ou d'intégration Hardy BPA dans `tests/hardy_pipeline_test.rs` pour toute nouvelle règle.
-4. Validez la porte de sécurité avant toute PR :
+2. Follow style conventions (`cargo fmt`) and the zero-`unwrap` policy in `src/`.
+3. Add Rego unit tests in `tests/rego_policies_test.rs` and/or Hardy BPA integration tests in `tests/hardy_pipeline_test.rs` for any new rule.
+4. Validate the security gate before opening any PR:
    ```bash
    ./scripts/check-security.sh --strict
    cargo test --offline --all-targets

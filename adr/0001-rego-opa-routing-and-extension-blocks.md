@@ -1,26 +1,26 @@
-# ADR-0001 : Moteur de routage déclaratif OPA/Rego et blocs d'extension BPv7
+# ADR-0001: Declarative OPA/Rego Routing Engine and BPv7 Extension Blocks
 
-- **Statut** : Accepté
-- **Date** : 2026-11-15
+- **Status**: Accepted
+- **Date**: 2026-11-15
 
-## Contexte
+## Context
 
-L'écosystème `dtn-postmaster` nécessite de supporter plusieurs algorithmes de routage et de filtrage (blacklist Ingress, Hop Count RFC 9171 §4.3.3, Spray-and-Wait, routage APRS à chemin futur et traçage TREB passé) sans figer les règles métier dans du code Rust recompilé à chaque ajustement opérationnel.
+The `dtn-postmaster` ecosystem needs to support multiple routing and filtering algorithms (Ingress blacklist, Hop Count RFC 9171 §4.3.3, Spray-and-Wait, future-path APRS routing, and past-path TREB tracing) without hardcoding business rules in Rust code that must be recompiled for every operational adjustment.
 
-## Décision
+## Decision
 
-1. **Moteur Rego embarqué (`regorus`)** : toutes les règles de décision sont exprimées en Rego (`policies/{dtn_constants,helpers,ingress,egress}.rego`), avec possibilité de surcharge par fichiers externes (`--policy-dir`) ou à chaud via SQLite/WebUI (`PUT /api/rego_routing/v1/policy`).
-2. **Intégration Hardy BPA via `FilterPack` + `WebModule::filter_packs()`** :
-   - `RegoIngressVerifier` et `RegoIngressClassifier` exécutent `data.dtn.ingress.decision`, stockent les mutations différées et `route_key` dans le slot `REGO_BUNDLE_DECISION` (`hardy_bpa::slot!`).
-   - `RegoEgressRewriter` exécute `data.dtn.egress.decision` au passage `Boundary::Egress` et applique les mutations sur les blocs via `ExtensionEditor`. L'incrément filaire du bloc Hop Count (Type 10) est laissé à `hardy_bpa::dispatcher::forward::update_extension_blocks` pour éviter un double incrément.
-   - `RegoRoutingAgent` implémente `hardy_bpa::routing::RoutingAgent` et fournit des helpers (`add_spray_route`, `add_spray_route_for_bundle`, `remove_spray_route`) s'appuyant sur `RouteAction::ForwardReplicate` de Hardy (`loic-fejoz/hardy`, branche `main-dtnpm`).
-3. **Format des blocs d'extension** :
-   - **Type 200 (`MeshRoutingData`)** : conforme à `mesh-algo-extension-block.cddl` (clés entières compactes 1..6 ; pour `scoped-alias`, la clé entière `5` porte `completed` afin de lever le recouvrement avec la clé `3` `max-count`, tout en acceptant les deux formes au décodage).
-   - **Type 194 (`SprayPermit`)** : entier `u32` CBOR simple assurant l'interopérabilité directe avec ION-DTN et Hardy `main-dtnpm`.
-   - **Type 201 configurable (`TrebData`)** : chemin passé conforme à `draft-koo-dtn-traceroute-eb` (`node_eid`, `arrival_time_ms`, `departure_time_ms`, `cla_info`).
-   - **Blocs custom arbitraires** : tout autre bloc expérimental CBOR est décodé récursivement (profondeur max 32) en JSON pour être inspectable depuis Rego via `helpers.get_custom_block`.
+1. **Embedded Rego Engine (`regorus`)**: all decision rules are expressed in Rego (`policies/{dtn_constants,helpers,ingress,egress}.rego`), with support for overrides via external files (`--policy-dir`) or hot-reloading via SQLite/WebUI (`PUT /api/rego_routing/v1/policy`).
+2. **Hardy BPA Integration via `FilterPack` + `WebModule::filter_packs()`**:
+   - `RegoIngressVerifier` and `RegoIngressClassifier` execute `data.dtn.ingress.decision`, storing deferred mutations and `route_key` in the `REGO_BUNDLE_DECISION` slot (`hardy_bpa::slot!`).
+   - `RegoEgressRewriter` executes `data.dtn.egress.decision` at `Boundary::Egress` and applies block mutations via `ExtensionEditor`. Wire-level incrementing of the Hop Count block (Type 10) is left to `hardy_bpa::dispatcher::forward::update_extension_blocks` to avoid double-incrementing.
+   - `RegoRoutingAgent` implements `hardy_bpa::routing::RoutingAgent` and provides helpers (`add_spray_route`, `add_spray_route_for_bundle`, `remove_spray_route`) built on Hardy's `RouteAction::ForwardReplicate` (`loic-fejoz/hardy`, `main-dtnpm` branch).
+3. **Extension Block Formats**:
+   - **Type 200 (`MeshRoutingData`)**: conforms to `mesh-algo-extension-block.cddl` (compact integer keys 1..6; for `scoped-alias`, integer key `5` carries `completed` to resolve the overlap with key `3` `max-count`, while accepting both forms when decoding).
+   - **Type 194 (`SprayPermit`)**: simple CBOR `u32` integer ensuring direct interoperability with ION-DTN and Hardy `main-dtnpm`.
+   - **Configurable Type 201 (`TrebData`)**: past path conforming to `draft-koo-dtn-traceroute-eb` (`node_eid`, `arrival_time_ms`, `departure_time_ms`, `cla_info`).
+   - **Arbitrary custom blocks**: any other experimental CBOR block is recursively decoded (max depth 32) into JSON so it can be inspected from Rego via `helpers.get_custom_block`.
 
-## Conséquences
+## Consequences
 
-- Les opérateurs/administrateurs peuvent bloquer des EIDs et adapter les politiques de routage à chaud sans redémarrer ni recompiler `dtnpm`.
-- Les opérations d'écriture REST (`/blacklist`, `/policy`) restent restreintes au rôle `Admin` via le PBAC de `dtnpm-core`.
+- Operators and administrators can block EIDs and adapt routing policies at runtime without restarting or recompiling `dtnpm`.
+- REST write operations (`/blacklist`, `/policy`) remain restricted to the `Admin` role via `dtnpm-core` PBAC.

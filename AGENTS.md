@@ -1,16 +1,18 @@
 # AGENTS.md — `dtnpm-mod-rego-routing`
 
-Consignes de développement et de sécurité applicables à ce dépôt :
+Development and security guidelines for this repository:
 
-1. **Architecture & Découplage** :
-   - Toute logique de décision de filtrage ou de routage (blacklist, hop limit, storm, Spray-and-Wait, APRS, TREB) doit rester déclarative dans `policies/*.rego` et compilée via `regorus`.
-   - Aucune dépendance réseau au runtime pour les politiques Rego ; le moteur fonctionne 100 % hors-ligne.
-2. **Hygiène Rust & CRA (Cyber Resilience Act)** :
-   - Zéro `.unwrap()`, `.expect()`, `panic!()` ou `todo!()` dans `src/` (vérifié par `cargo clippy -- -D warnings -D clippy::unwrap_used -D clippy::panic`).
-   - Validation stricte de toutes les entrées utilisateur (motifs EID ≤ 256 octets ASCII imprimables avec schéma URI BPv7, taille des politiques Rego ≤ 256 KiB, profondeur CBOR ≤ 32, plage expérimentale TREB `192..=255`).
-   - Les caches en mémoire (`seen_cache`, `spray_tracker`, `decision_log`) doivent rester strictement bornés.
-   - Les erreurs d'`ExtensionEditor` (par ex. bloc protégé par BPSec BIB/BCB) doivent être journalisées sans interrompre le BPA.
-3. **PBAC / IAM** :
-   - Les opérations d'écriture sur `/blacklist` et `/policy` doivent rester réservées au rôle `Admin` dans `dtnpm-core/src/iam/default_policy.rego`.
-4. **Qualité avant commit** :
-   - Exécuter `cargo fmt --all -- --check`, `./scripts/check-security.sh --strict` et `cargo test --offline --all-targets`.
+1. **Documentation Language**:
+   - English must be used as the language for all documentation, unless the file is suffixed with `.fr.md` or another language is explicitly requested in the prompt.
+2. **Architecture & Decoupling**:
+   - All filtering or routing decision logic (blacklist, hop limit, storm, Spray-and-Wait, APRS, TREB) must remain declarative in `policies/*.rego` and compiled via `regorus`.
+   - No runtime network dependencies for Rego policies; the engine operates 100% offline.
+3. **Rust Hygiene & CRA (Cyber Resilience Act)**:
+   - Zero `.unwrap()`, `.expect()`, `panic!()`, or `todo!()` in `src/` (enforced by `cargo clippy -- -D warnings -D clippy::unwrap_used -D clippy::panic`).
+   - Strict validation of all user inputs (EID patterns <= 256 printable ASCII bytes with BPv7 URI scheme, Rego policy size <= 256 KiB, CBOR depth <= 32, TREB experimental range `192..=255`).
+   - In-memory caches (`seen_cache`, `spray_tracker`, `decision_log`) must remain strictly bounded.
+   - `ExtensionEditor` errors (e.g., block protected by BPSec BIB/BCB) must be logged without interrupting the BPA.
+4. **PBAC / IAM**:
+   - Write operations on `/blacklist` and `/policy` must remain restricted to the `Admin` role in `dtnpm-core/src/iam/default_policy.rego`.
+5. **Pre-commit Quality**:
+   - Run `cargo fmt --all -- --check`, `./scripts/check-security.sh --strict`, and `cargo test --offline --all-targets`.
