@@ -2,6 +2,10 @@
 
 Declarative **OPA / Rego** extension module (powered by [`regorus`](https://crates.io/crates/regorus)) for **DTN Postmaster (`dtnpm`)** and **Hardy BPA**.
 
+## Screenshot
+
+![Rego Routing & Policy UI](docs/screenshots/rego-routing.png)
+
 ## Features
 
 - **Ingress Filtering via EID Blacklist**: exact match (`dtn://spam/app`) and wildcard patterns (`dtn://spam/*`, `ipn:99.*`), silent drop without status report (anti-amplification), and real-time CRUD management via REST API / WebUI / SQLite.
